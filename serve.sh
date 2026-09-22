@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Example launcher for scripts/serve-intel-ar.sh — point the paths at your
+# machine (or keep your real settings as a local-only commit on top of this).
+# Every knob here is passed through to serve-intel-ar.sh's docker run;
+# anything unset falls back to that script's defaults.
+cd "$(dirname "$0")" || exit 1
+
+# Required: the prepared checkpoint (int4 experts + int8 lm_head + fp8 side
+# layers — see tools/) and the stripped fp8 ngram/PLE table directory.
+# The -MTP_int4RTN variant (int4 draft experts, -3.5 GiB, the default) is
+# built by prepare.sh step 8 / tools/quantize_mtp_experts_int4.py; the plain
+# -hybrid dir (bf16 draft) works too.
+export MODEL_DIR="/models/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN"
+export TABLE_DIR="/models/ple-table-fp8"
+
+export PORT=8000
+export SERVED_NAME=qwen
+export TOOL_PARSER=qwen3_xml
+export SEQS=8
+export MTP=3
+export PREFIX_CACHE=1
+
+# API key (Bearer token) for the OpenAI-compatible endpoint:
+#   non-empty -> clients must send "Authorization: Bearer <key>" (vLLM --api-key)
+#   empty     -> no auth, as before (closed-network deployment)
+# Generate: openssl rand -hex 32  (hex: no spaces/quotes, safe to inline here).
+# To keep the secret out of git, read it from a file outside the repo instead:
+#   export API_KEY="$(cat "$HOME/.qwen-api-key")"
+# /health stays open (container HEALTHCHECK unaffected); curl examples and
+# bench/decode_bench.py will need the Authorization header while this is set.
+export API_KEY=''
+
+# Deterministic memory sizing for unified-memory boxes (GB10 / DGX Spark):
+# near-zero utilization fraction plus an explicit KV pool, so the driver
+# never oversubscribes the unified pool (NV_ERR_NO_MEMORY / Xid 31 crashes).
+export GPU_MEM=0.01
+export KV_BYTES=20g
+
+# Context: 262144 native. For 500k via YaRN set CTX=500000 YARN=1 (the
+# upstream-validated ceiling). One 500k request costs ~15 GiB of KV
+# (~29 KB/token), so the default 20g pool fits exactly one such request —
+# raise KV_BYTES (carefully) for concurrent long contexts. See SETUP-RU.md §7.2.
+export CTX=262144
+export YARN=0
+
+# Restart policy of the container: unless-stopped = авто-запуск после ребута
+# машины и перезапуск после падений (остановленный вручную не поднимется);
+# no = только ручной запуск через ./serve.sh.
+export RESTART=unless-stopped
+
+# madvise(MADV_RANDOM) the PLE mmap: no readahead around 160-byte row faults.
+# Upstream (blazux 0c6df7e) measured 4-8% faster cold prefill and a cleaner
+# page cache; on by default. 0 = kernel readahead (worth trying when the
+# table sits on remote RAM with no page-cache headroom).
+export PLE_MADV_RANDOM=1
+
+# Engine-side metrics sidecar port (PLE gather counters, the mamba guard
+# tripwire, the never-evict pin gauges — vllm_custom_metrics): served from the
+# engine process on its own endpoint, because vLLM's /metrics in the API
+# process cannot see them. 0 = off. PLE log lines are off by default now
+# (PLE_STATS_SEC=0) — the same numbers are on this endpoint.
+export METRICS_PORT=18400
+
+# Prefix-cache diagnosis logging (VLLM_HIT_DEBUG=1 in the container):
+# per-group hit breakdown, mamba boundary publication, evictions, chunk stops.
+export HIT_DEBUG=0
+
+# Never-evict pin: any request whose prompt contains this exact substring has
+# its prompt-prefix KV blocks pinned (held out of eviction) — meant for a
+# long fixed system prompt. Empty disables it.
+export PIN_PROMPT=''
+
+exec scripts/serve-intel-ar.sh

@@ -1,0 +1,617 @@
+Run **Qwen3.8-Flash-Next** — a ~176B-parameter model (125B main + 51B n-gram, 6B
+active) — on **one NVIDIA DGX Spark / ASUS GX10** with **vLLM**: **~49 tok/s
+single-stream decode with MTP=3** (~2,000 tok/s prefill), working **prefix
+caching**, and a **never-evict pin** that keeps your system prompt's KV resident
+through arbitrary traffic.
+
+Forked from **[blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX)**,
+which established the foundation this fork stands on: the ~49 GiB fp8 n-gram ("PLE")
+table is a pure lookup that a token only touches 16 rows of, so it is served
+**from NVMe via `mmap`** instead of living in the 128 GB unified pool
+(full story: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)). Upstream serves the
+official **NVFP4** checkpoint at 25–28 tok/s; for that path and its tuning
+guide, use upstream. This fork replaces the checkpoint with
+**[Intel's W4A16 AutoRound int4](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)**
+plus an int8 GPTQ lm_head and blockwise-fp8 side layers (all prepared by
+CPU-only tools in `tools/`), an **fp8** PLE table, and a set of GB10/vLLM
+patches — roughly **1.8× faster decode** than the NVFP4 recipe on the same box.
+
+> **Upstream's NVFP4 recipe independently reproduced** on a DGX Spark by
+> [@jschmied](https://github.com/jschmied) — see
+> [blazux#1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
+> [write-up](https://github.com/jschmied/qwen38-flash-next-gb10), which also
+> contributed the concurrency findings below.
+
+| | llama.cpp IQ4_XS | upstream (vLLM NVFP4) | **this fork (int4/int8/fp8)** |
+|---|---|---|---|
+| Prefill | ~540 tok/s | ~2,000–2,600 tok/s | **~2,000 tok/s** |
+| Decode, single stream | ~22 tok/s (no MTP) | 25–28 tok/s (MTP=2) | **~49 tok/s (MTP=3)** |
+| Prefix caching | — | off (GDN kernel bug) | **on** (+ never-evict pin) |
+| Context | 262k | 262k native / 500k YaRN | 262k native / 500k YaRN |
+| Weights resident | ~94 GiB (GGUF) | ~76 GiB | **~71 GiB** |
+
+## Throughput and concurrency
+
+Measured on this stack (DGX Spark, MTP=3 speculative decoding, prefix caching
+on, `SEQS=8`). Single-stream decode by workload — reproduce with
+[bench_qwen35.sh](https://github.com/albond/DGX_Spark_Qwen3.5-122B-A10B-AR-INT4/blob/master/bench_qwen35.sh)
+(from albond's 122B recipe) pointed at your endpoint; two runs, best of:
+
+| Task | Prompt Tokens | Gen Tokens | Time (s) | Speed (tok/s) |
+| --- | --- | --- | --- | --- |
+| **[Q&A]** | 65 | 67.2 ± 14.9 | 1.55 ± 0.43 | 44.1 ± 4.1 |
+| **[Code]** | 72 | 403.8 ± 119.0 | 8.82 ± 3.46 | 47.4 ± 5.2 |
+| **[JSON]** | 90 | 835.5 ± 15.7 | 13.94 ± 0.57 | 60.0 ± 1.6 |
+| **[Math]** | 71 | 64.0 ± 0.0 | 1.24 ± 0.04 | 51.7 ± 1.6 |
+| **[LongCode]** | 79 | 2048.0 ± 0.0 | 43.09 ± 4.00 | 47.8 ± 4.3 |
+
+*Note: Values represent the arithmetic mean across all 6 benchmark runs (3 scripts × 2 runs each). The `±` values indicate the sample standard deviation.*
+
+
+llama-benchy
+| model   |                  test |    t/s (total) |       t/s (req) |       peak t/s |   peak t/s (req) |             ttfr (ms) |          est_ppt (ms) |         e2e_ttft (ms) |
+|:--------|----------------------:|---------------:|----------------:|---------------:|-----------------:|----------------------:|----------------------:|----------------------:|
+| qwen    |           pp2048 (c1) | 978.53 ± 99.36 |  978.53 ± 99.36 |                |                  |      2118.24 ± 201.94 |      2114.45 ± 201.94 |      2118.24 ± 201.94 |
+| qwen    |            tg128 (c1) |   33.64 ± 1.93 |    33.64 ± 1.93 |   41.33 ± 1.89 |     41.33 ± 1.89 |                       |                       |                       |
+| qwen    |           pp2048 (c2) | 819.75 ± 95.54 |  423.12 ± 59.59 |                |                  |      4950.08 ± 736.23 |      4946.29 ± 736.23 |      4950.08 ± 736.23 |
+| qwen    |            tg128 (c2) |   53.65 ± 6.78 |    28.09 ± 2.92 |   72.33 ± 6.18 |     37.17 ± 3.72 |                       |                       |                       |
+| qwen    |           pp2048 (c4) | 809.16 ± 19.50 |  207.41 ± 10.13 |                |                  |      9905.32 ± 466.83 |      9901.53 ± 466.83 |      9905.32 ± 466.83 |
+| qwen    |            tg128 (c4) |   63.64 ± 1.31 |    18.66 ± 1.45 |  109.33 ± 4.50 |     29.00 ± 3.16 |                       |                       |                       |
+| qwen    |           pp2048 (c8) | 866.80 ± 22.25 |  122.35 ± 31.04 |                |                  |    17466.22 ± 2849.56 |    17462.43 ± 2849.56 |    17466.22 ± 2849.56 |
+| qwen    |            tg128 (c8) |   52.54 ± 2.33 |    11.63 ± 2.08 |  152.67 ± 7.32 |     21.08 ± 1.78 |                       |                       |                       |
+| qwen    |          pp2048 (c16) | 860.78 ± 15.11 |   81.11 ± 37.32 |                |                  |    29150.68 ± 9020.76 |    29146.89 ± 9020.76 |    29150.68 ± 9020.76 |
+| qwen    |           tg128 (c16) |   50.13 ± 1.13 |     6.84 ± 2.46 |  239.33 ± 3.30 |     16.90 ± 1.75 |                       |                       |                       |
+| qwen    |   ctx_pp @ d8192 (c1) | 966.28 ± 32.27 |  966.28 ± 32.27 |                |                  |      8493.42 ± 280.33 |      8489.63 ± 280.33 |      8493.42 ± 280.33 |
+| qwen    |   ctx_tg @ d8192 (c1) |   29.97 ± 3.73 |    29.97 ± 3.73 |   38.00 ± 5.72 |     38.00 ± 5.72 |                       |                       |                       |
+| qwen    |   pp2048 @ d8192 (c1) | 558.92 ± 16.80 |  558.92 ± 16.80 |                |                  |      3671.40 ± 112.41 |      3667.61 ± 112.41 |      3671.40 ± 112.41 |
+| qwen    |    tg128 @ d8192 (c1) |   29.99 ± 1.43 |    29.99 ± 1.43 |   38.67 ± 2.49 |     38.67 ± 2.49 |                       |                       |                       |
+| qwen    |   ctx_pp @ d8192 (c2) | 905.27 ± 39.74 |  482.42 ± 35.94 |                |                  |    17083.88 ± 1281.01 |    17080.09 ± 1281.01 |    17083.88 ± 1281.01 |
+| qwen    |   ctx_tg @ d8192 (c2) |   30.74 ± 1.90 |    19.58 ± 3.04 |   54.33 ± 2.87 |     30.83 ± 3.76 |                       |                       |                       |
+| qwen    |   pp2048 @ d8192 (c2) | 519.35 ± 28.79 |  269.91 ± 18.22 |                |                  |      7625.54 ± 506.34 |      7621.75 ± 506.34 |      7625.54 ± 506.34 |
+| qwen    |    tg128 @ d8192 (c2) |   43.59 ± 1.71 |    24.15 ± 1.79 |   64.00 ± 4.55 |     33.33 ± 2.75 |                       |                       |                       |
+| qwen    |   ctx_pp @ d8192 (c4) | 942.12 ± 22.08 |  283.66 ± 59.87 |                |                  |    29983.95 ± 5210.34 |    29980.16 ± 5210.34 |    29983.95 ± 5210.34 |
+| qwen    |   ctx_tg @ d8192 (c4) |   23.71 ± 0.27 |    11.75 ± 3.77 |   72.67 ± 0.94 |     24.17 ± 2.79 |                       |                       |                       |
+| qwen    |   pp2048 @ d8192 (c4) | 490.67 ± 46.66 |  124.56 ± 12.46 |                |                  |    16617.26 ± 1718.98 |    16613.47 ± 1718.98 |    16617.26 ± 1718.98 |
+| qwen    |    tg128 @ d8192 (c4) |   59.91 ± 1.69 |    18.35 ± 1.82 |   99.33 ± 5.19 |     27.92 ± 1.75 |                       |                       |                       |
+| qwen    |   ctx_pp @ d8192 (c8) | 859.44 ± 16.30 |  174.47 ± 80.64 |                |                  |   54965.03 ± 18411.35 |   54961.24 ± 18411.35 |   54965.03 ± 18411.35 |
+| qwen    |   ctx_tg @ d8192 (c8) |   15.61 ± 0.27 |     5.65 ± 3.32 |  107.00 ± 2.94 |     17.75 ± 1.96 |                       |                       |                       |
+| qwen    |   pp2048 @ d8192 (c8) | 482.92 ± 20.85 |   80.53 ± 23.49 |                |                  |    27365.78 ± 6822.77 |    27362.00 ± 6822.77 |    27365.78 ± 6822.77 |
+| qwen    |    tg128 @ d8192 (c8) |   34.19 ± 1.85 |     8.62 ± 3.22 |  124.67 ± 5.31 |     18.92 ± 1.63 |                       |                       |                       |
+| qwen    |  ctx_pp @ d8192 (c16) | 796.71 ± 21.61 |  108.06 ± 73.20 |                |                  |  102329.57 ± 45329.83 |  102325.78 ± 45329.83 |  102329.57 ± 45329.83 |
+| qwen    |  ctx_tg @ d8192 (c16) |   13.01 ± 0.10 |     2.94 ± 2.59 |  172.00 ± 8.60 |     15.42 ± 2.04 |                       |                       |                       |
+| qwen    |  pp2048 @ d8192 (c16) | 230.70 ± 14.23 |   31.66 ± 18.65 |                |                  |   83882.85 ± 37703.32 |   83879.06 ± 37703.32 |   83882.85 ± 37703.32 |
+| qwen    |   tg128 @ d8192 (c16) |   16.09 ± 1.86 |     2.91 ± 2.51 |  176.33 ± 8.06 |     14.79 ± 2.09 |                       |                       |                       |
+| qwen    |  ctx_pp @ d16384 (c1) | 883.24 ± 45.39 |  883.24 ± 45.39 |                |                  |     18607.24 ± 988.95 |     18603.45 ± 988.95 |     18608.95 ± 989.37 |
+| qwen    |  ctx_tg @ d16384 (c1) |   29.05 ± 3.44 |    29.05 ± 3.44 |   37.67 ± 3.30 |     37.67 ± 3.30 |                       |                       |                       |
+| qwen    |  pp2048 @ d16384 (c1) | 508.40 ± 37.35 |  508.40 ± 37.35 |                |                  |      4053.14 ± 286.49 |      4049.35 ± 286.49 |      4055.36 ± 286.67 |
+| qwen    |   tg128 @ d16384 (c1) |   31.33 ± 0.53 |    31.33 ± 0.53 |   37.67 ± 3.09 |     37.67 ± 3.09 |                       |                       |                       |
+| qwen    |  ctx_pp @ d16384 (c2) | 826.91 ± 36.93 |  434.83 ± 27.06 |                |                  |    37837.33 ± 2424.36 |    37833.54 ± 2424.36 |    37837.74 ± 2424.42 |
+| qwen    |  ctx_tg @ d16384 (c2) |   26.12 ± 0.84 |    17.51 ± 4.01 |   58.00 ± 5.72 |     30.50 ± 3.59 |                       |                       |                       |
+| qwen    |  pp2048 @ d16384 (c2) | 445.85 ± 20.80 |  227.70 ± 11.80 |                |                  |      9021.50 ± 454.09 |      9017.71 ± 454.09 |      9022.55 ± 454.04 |
+| qwen    |   tg128 @ d16384 (c2) |   46.71 ± 2.18 |    25.49 ± 1.26 |   66.67 ± 6.80 |     35.83 ± 3.39 |                       |                       |                       |
+| qwen    |  ctx_pp @ d16384 (c4) | 829.48 ± 39.62 | 294.39 ± 100.96 |                |                  |   61597.33 ± 17716.73 |   61593.54 ± 17716.73 |   61598.07 ± 17717.17 |
+| qwen    |  ctx_tg @ d16384 (c4) |    9.57 ± 0.87 |     8.46 ± 5.49 |   77.00 ± 4.32 |     24.92 ± 3.62 |                       |                       |                       |
+| qwen    |  pp2048 @ d16384 (c4) | 407.21 ± 36.73 |   103.23 ± 9.88 |                |                  |    20013.87 ± 1794.36 |    20010.08 ± 1794.36 |    20016.59 ± 1794.12 |
+| qwen    |   tg128 @ d16384 (c4) |   56.62 ± 2.08 |    16.38 ± 1.18 |   91.33 ± 2.36 |     25.83 ± 1.82 |                       |                       |                       |
+| qwen    |  ctx_pp @ d16384 (c8) | 837.60 ± 13.74 | 199.70 ± 110.79 |                |                  |  103123.60 ± 41207.95 |  103119.81 ± 41207.95 |  103124.15 ± 41208.24 |
+| qwen    |  ctx_tg @ d16384 (c8) |    7.73 ± 0.10 |     3.76 ± 3.37 |  101.33 ± 5.73 |     17.71 ± 1.88 |                       |                       |                       |
+| qwen    |  pp2048 @ d16384 (c8) | 397.71 ± 14.45 |   64.67 ± 17.56 |                |                  |    33727.73 ± 7788.53 |    33723.94 ± 7788.53 |    33730.31 ± 7788.05 |
+| qwen    |   tg128 @ d16384 (c8) |   31.16 ± 0.74 |     8.08 ± 3.06 |  121.67 ± 6.13 |     18.67 ± 1.55 |                       |                       |                       |
+| qwen    | ctx_pp @ d16384 (c16) | 711.65 ± 14.92 | 127.77 ± 105.07 |                |                  | 197113.04 ± 105312.74 | 197109.25 ± 105312.74 | 197113.86 ± 105313.01 |
+| qwen    | ctx_tg @ d16384 (c16) |    5.81 ± 0.04 |     2.50 ± 4.22 | 116.67 ± 18.66 |     13.31 ± 7.48 |                       |                       |                       |
+| qwen    | pp2048 @ d16384 (c16) | 109.22 ± 12.44 |   19.08 ± 13.85 |                |                  |  157186.72 ± 86070.14 |  157182.93 ± 86070.14 |  157187.58 ± 86070.24 |
+| qwen    |  tg128 @ d16384 (c16) |    7.31 ± 0.96 |     2.63 ± 4.44 | 126.67 ± 30.94 |     15.19 ± 5.95 |                       |                       |                       |
+| qwen    |  ctx_pp @ d32768 (c1) | 938.98 ± 14.29 |  938.98 ± 14.29 |                |                  |     34911.05 ± 526.06 |     34907.26 ± 526.06 |     34912.68 ± 527.21 |
+| qwen    |  ctx_tg @ d32768 (c1) |   37.25 ± 9.11 |    37.25 ± 9.11 |   42.76 ± 7.05 |     42.76 ± 7.05 |                       |                       |                       |
+| qwen    |  pp2048 @ d32768 (c1) | 482.48 ± 15.85 |  482.48 ± 15.85 |                |                  |      4253.20 ± 142.80 |      4249.42 ± 142.80 |      4256.82 ± 142.51 |
+| qwen    |   tg128 @ d32768 (c1) |   36.67 ± 2.78 |    36.67 ± 2.78 |   45.33 ± 5.44 |     45.33 ± 5.44 |                       |                       |                       |
+| qwen    |  ctx_pp @ d32768 (c2) |  848.62 ± 2.33 |  511.83 ± 87.91 |                |                  |   65966.33 ± 11289.94 |   65962.54 ± 11289.94 |   65968.46 ± 11290.31 |
+| qwen    |  ctx_tg @ d32768 (c2) |    9.00 ± 0.41 |    13.44 ± 9.01 |   58.00 ± 3.56 |     31.83 ± 2.79 |                       |                       |                       |
+| qwen    |  pp2048 @ d32768 (c2) | 406.66 ± 11.39 |   208.24 ± 8.09 |                |                  |      9853.62 ± 381.43 |      9849.84 ± 381.43 |      9855.25 ± 382.43 |
+| qwen    |   tg128 @ d32768 (c2) |   46.00 ± 1.09 |    24.55 ± 1.49 |   66.00 ± 3.56 |     34.50 ± 1.71 |                       |                       |                       |
+| qwen    |  ctx_pp @ d32768 (c4) |  825.50 ± 5.42 | 348.68 ± 156.67 |                |                  |  111658.14 ± 40892.22 |  111654.35 ± 40892.22 |  111660.03 ± 40892.42 |
+| qwen    |  ctx_tg @ d32768 (c4) |    4.52 ± 0.03 |     5.83 ± 5.78 |   75.33 ± 3.86 |     24.92 ± 3.93 |                       |                       |                       |
+| qwen    |  pp2048 @ d32768 (c4) | 379.53 ± 16.71 |    98.98 ± 7.23 |                |                  |    20799.31 ± 1427.80 |    20795.52 ± 1427.80 |    20802.22 ± 1427.56 |
+| qwen    |   tg128 @ d32768 (c4) |   46.33 ± 0.81 |    15.63 ± 1.88 |   86.00 ± 3.27 |     24.83 ± 3.00 |                       |                       |                       |
+| qwen    |  ctx_pp @ d32768 (c8) |  836.05 ± 4.77 | 240.57 ± 165.51 |                |                  |  189390.19 ± 87563.03 |  189386.40 ± 87563.03 |  189392.01 ± 87562.82 |
+| qwen    |  ctx_tg @ d32768 (c8) |    3.65 ± 0.16 |     2.51 ± 3.49 |   93.00 ± 2.94 |     18.12 ± 3.82 |                       |                       |                       |
+| qwen    |  pp2048 @ d32768 (c8) | 238.61 ± 25.96 |   47.32 ± 20.15 |                |                  |   49398.87 ± 15918.62 |   49395.08 ± 15918.62 |   49401.89 ± 15918.51 |
+| qwen    |   tg128 @ d32768 (c8) |   20.94 ± 5.33 |     6.05 ± 3.71 |  122.33 ± 7.41 |     19.67 ± 2.82 |                       |                       |                       |
+| qwen    | ctx_pp @ d32768 (c16) |  835.16 ± 9.22 | 151.90 ± 140.90 |                |                  | 347235.44 ± 180289.05 | 347231.65 ± 180289.05 | 347236.20 ± 180288.59 |
+| qwen    | ctx_tg @ d32768 (c16) |    3.36 ± 0.12 |     1.85 ± 3.26 |   96.67 ± 4.50 |     17.00 ± 4.64 |                       |                       |                       |
+| qwen    | pp2048 @ d32768 (c16) |   65.44 ± 8.21 |   18.70 ± 21.73 |                |                  | 238706.07 ± 165209.85 | 238702.28 ± 165209.85 | 238707.03 ± 165209.32 |
+| qwen    |  tg128 @ d32768 (c16) |    4.22 ± 0.45 |     1.78 ± 3.36 | 138.33 ± 10.62 |     18.75 ± 3.56 |                       |                       |                       |
+
+
+
+The TTFT growth with concurrency is MTP's prefill cost (see the next
+section), not the paged table. On upstream's NVFP4 path
+[@jschmied](https://github.com/jschmied) measured aggregate throughput
+scaling to ~267 tok/s at 48 streams
+([load-and-waits.md](https://github.com/jschmied/qwen38-flash-next-gb10/blob/main/notes/load-and-waits.md));
+two portable takeaways: per-token page-fault cost *falls* with concurrency
+(batched tokens share n-gram rows), and a low `--max-num-seqs` silently
+queues requests — check `vllm:request_queue_time_seconds_sum` before quoting
+an aggregate number.
+
+## Requirements
+
+- An **NVIDIA DGX Spark or compatible GB10 (sm_121)** box, 128 GB unified memory,
+  aarch64, recent NVIDIA driver, Docker with the NVIDIA container runtime.
+- **~150 GB free disk** (~122 GB for the checkpoint + fp8 PLE table, ~20 GB for
+  the Docker image and build cache), on reasonably fast storage (the table is
+  read at runtime — NVMe strongly recommended).
+- The base image is multi-arch, so `docker build` also works on x86 Blackwell
+  (sm_120) for testing, though this is tuned for the Spark.
+
+## Quickstart
+
+```bash
+git clone https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound.git
+cd qwen3.8-Flash-DGX-AutoRound
+
+docker build -t qwen38-flash-dgx .   # official image + this fork's patches
+
+# The prepared checkpoint + PLE table (one-time, ~122 GiB):
+hf download Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN --local-dir /models/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN
+hf download Saren/Qwen3.8-Flash-Next-ple-table-fp8 --local-dir /models/ple-table-fp8
+# (or build them yourself from Intel's release: ./prepare.sh — see below)
+# The plain -hybrid repo (bf16 MTP draft, +3.5 GiB) works too as MODEL_DIR.
+
+# Point serve.sh at your checkpoint + table dirs, then:
+./serve.sh                           # boots on :8000 (~5 min with fastsafetensors)
+docker logs -f qwen38-flash          # wait for "Application startup complete"
+```
+
+Then hit the OpenAI-compatible API:
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen",
+  "messages": [{"role":"user","content":"Write a haiku about a desktop supercomputer."}],
+  "max_tokens": 512
+}'
+```
+
+> **Sampling defaults come from the model's `generation_config.json`**, not
+> from vLLM: `temperature: 1.0, top_k: 20, top_p: 0.95` (Qwen's
+> recommendation; vLLM logs a warning about the override at boot). Any request
+> that does not set `temperature` explicitly is sampled, not greedy. The
+> repo's benches and `tools/eval_quality.py` always pass `temperature: 0`, so
+> they are unaffected; clients that want deterministic answers should set
+> `temperature` themselves (or relaunch with `--generation-config vllm` via
+> `EXTRA` to restore vLLM's greedy defaults).
+
+`serve.sh` is a thin example config over `scripts/serve-intel-ar.sh` — every
+knob is an env var. The defaults below are `serve.sh`'s (the recommended
+entry point); where the bare `scripts/serve-intel-ar.sh` falls back to
+something else, the note says so. Keep your machine's real settings as an
+edited copy or a local-only commit on top.
+
+## Modify the weights yourself
+
+The quickstart's two `hf download` repos are the finished artifacts — hashes
+verified against the local originals. If you'd rather build (or audit) them
+yourself from
+[Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound),
+one script runs the whole pipeline (CPU-only — a NAS box is fine):
+
+```bash
+./prepare.sh /models/Qwen3.8-Flash-Next-W4A16-AutoRound /models/ple-table-fp8
+```
+
+Step 1 verifies the download: every file the safetensors index references must
+be present, and the script stops with the missing file names if not. That check
+earns its keep — the public Intel repo currently lists 17 shards but serves no
+`model-00002-of-00017.safetensors`, so a from-scratch build can be blocked at
+the very first step; missing files that hold only the n-gram table are fine
+(step 4 strips them from the index, and the table comes from `TABLE_DIR`).
+The upstream fork's script downloaded `…-W4A16-RTN-AutoRound` here, a name that
+answers 401 anonymously (gated or renamed) — substitute it in the `hf download`
+line if you have access to it. When in doubt, the Quickstart's prebuilt
+artifacts skip this path entirely.
+
+Each step is explained in `prepare.sh`'s header comments: int8 lm_head repack,
+fp8 side-layer conversion, n-gram index strip, fp8 table fetch, the
+`quantization_config` rewrite, and the int4 RTN quantization of the MTP draft
+layer's 512 experts — step 8 writes a hardlinked `<ckpt>-MTP_int4RTN` variant
+(no extra disk space) with the `layers.48` exclusion dropped, so the draft runs
+on the GPTQ-Marlin MoE path like the main layers (−3.5 GiB resident, +2–4%
+decode). That variant is the default `MODEL_DIR`. On that config rewrite: this
+vLLM build has no auto-round loader, but its GPTQ config
+(`AutoGPTQConfig` → Marlin kernels) reads the same packed tensors — the
+GPTQModel-style `dynamic` rules exclude the families that are not int4-packed
+and flip the head to 8-bit. The original AutoRound config is kept as
+`config.json.autoround`. To only add the int4-draft variant to an existing
+prepared checkpoint, run `tools/quantize_mtp_experts_int4.py <ckpt> <ckpt>-MTP_int4RTN`.
+
+## Serving
+
+```bash
+docker build -t qwen38-flash-dgx .
+MODEL_DIR=/models/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN \
+TABLE_DIR=/models/ple-table-fp8 \
+PREFIX_CACHE=1 PIN_PROMPT="You are HomeBot, the household assistant." \
+scripts/serve-intel-ar.sh
+```
+
+or edit the paths in `serve.sh` (the example config used above) and run it.
+
+| Var | `serve.sh` default | Notes |
+|---|---|---|
+| `MODEL_DIR` / `TABLE_DIR` | `/path/to/...` — edit these | Prepared checkpoint / fp8 PLE table dirs |
+| `PORT` | `8000` | API port (bare script: `18300`) |
+| `CTX` | `262144` | Max context |
+| `YARN` | `0` | `1` + `CTX=500000` — 500k context via YaRN rope scaling (upstream-validated ceiling; the launcher pins the draft model's length so MTP boots — SETUP-RU §7.2) |
+| `SEQS` | `8` | Max concurrent sequences (don't benchmark with 1–2, see below) |
+| `GPU_MEM` | `0.01` | Near-zero pool fraction, paired with `KV_BYTES`: deterministic sizing, so the driver never oversubscribes the unified pool (`NV_ERR_NO_MEMORY` / Xid 31 freezes). Bare script: a `0.85` fraction — avoid on unified-memory boxes. |
+| `KV_BYTES` | `20g` | Explicit KV pool size, passed as `--kv-cache-memory-bytes` (bare script: unset) |
+| `MTP` | `3` | Speculative tokens from the MTP head (`0` = off; bare script: `2`) |
+| `DRAFT_VOCAB` | `1` | The MTP drafter scores only the 65,536 most frequent tokens instead of all 248,320 (private draft-head patch, from upstream blazux): +3–5% decode on English/code. The shipped id set is English/code-weighted — CJK/ru-heavy traffic may prefer `0` (full vocab) or a custom set built with `tools/build_draft_vocab.py` (a custom `ids.npy` must live inside the checkpoint dir and be passed as `/model/<name>.npy` — those are the only paths the container sees). **Needs an image rebuilt with the Dockerfile's draft-head section — the launcher probes the image and warns loudly when it predates the patch (the env is then ignored by vLLM)** |
+| `DRAFT_HEAD` | `int8` | `int4` = a private int4 g128 RTN Marlin copy of the full-vocabulary head (~320 MB vs 616 MiB read per draft step, no vocabulary restriction). Measured a wash upstream (acceptance 1–8 points lower), so the shared int8 head stays the default. Same image requirement/warning as `DRAFT_VOCAB` |
+| `PREFIX_CACHE` | `1` | Prefix caching — fixed and recommended on this fork (bare script: `0`) |
+| `PIN_PROMPT` / `PIN_MAX_FRACTION` | unset / `0.25` | Never-evict pin (patch 6); needs `PREFIX_CACHE=1` |
+| `API_KEY` | unset | Non-empty → Bearer auth on the API (vLLM `--api-key`; generate with `openssl rand -hex 32`). `/health` stays open; the key is visible in `docker inspect` |
+| `FP8_HYBRID` | `1` | int4+fp8 hybrid dispatch (patch 4) |
+| `PLE_MADV_RANDOM` | `1` | `MADV_RANDOM` on the table mmap (patch 1): no readahead around 160-byte row faults — upstream measured 4–8% faster cold prefill; `0` = kernel readahead (try when the table sits on remote RAM with no page-cache headroom) |
+| `METRICS_PORT` | `18400` | Engine-side Prometheus sidecar (`src/vllm_custom_metrics.py`): `vllm:ple_mmap_*` counters (ops, op/gather ms, rows, bytes, prefetch hit/miss), `vllm:mamba_state_copy_guard_total` (tripwire, expect 0) and `vllm:never_evict_{blocks_reserved,pin_queue_blocks,pin_bytes}` gauges. vLLM's own `/metrics` runs in the API-server process and cannot see EngineCore counters, so these are served from the engine process on this separate port; `0` = off. The launcher probes the image for both the module and its start hooks, and warns when the sidecar cannot come up (the port would just stay closed) |
+| `PLE_PREFETCH` | `0` | Batch-assembly prefetch — measured not worth enabling (see appendix) |
+| `PLE_CHUNK` / `PLE_FAST_ROWS` / `PLE_STATS_SEC` | `2048` / `512` / `0`* | Gather rows per task / decode fast-path threshold / stats-log period. The log lines are off by default since the numbers moved to the metrics sidecar (`METRICS_PORT`); set `30` to bring them back. *On an image without the metrics module the launcher keeps the log lines at `30` automatically (and says so), so nothing goes silent |
+| `HIT_DEBUG` | `0` | Prefix-cache tracing (patch 8) |
+| `HIT_DEBUG_N` | `0` | Event budget for `HIT_DEBUG=1`; tracing auto-disables with a warning once spent |
+| `STEP_PROFILE` | `0` | `1` — on-demand torch profiler, triggered by `touch /tmp/profile_trigger` inside the container (patch 9) |
+| `PREWARM` | `1` | Stream the table once at boot to warm the page cache |
+| `WORKERS` | `32` | Threads for the mmap gather |
+| `LOAD_FORMAT` | `fastsafetensors` | Noticeably faster cold boots |
+| `TOOL_PARSER` | `qwen3_xml` | Tool-call parser (bare script: `qwen3_coder`) |
+| `SERVED_NAME` | `qwen` | Model id on the API (bare script: `qwen3.8-flash-next`) |
+| `FLASHINFER_AUTOTUNE` | `0` | `1` — enable flashinfer kernel autotuning (longer warmup, possibly faster kernels) |
+| `CUDA_LAUNCH_BLOCKING` | `0` | `1` — synchronous CUDA errors, for debugging Xid 31 (much slower; not for production) |
+| `RESTART` | `unless-stopped` | Container restart policy — survives reboots and crashes; `no` = manual start only. The next `./serve.sh` re-creates the container with this value |
+| `LOG_MAX_SIZE` / `LOG_MAX_FILE` | `10m` / `3` | Docker log rotation — `PLE mmap stats` logs a line every 30 s, so an unbounded log grows to GBs |
+| `NAME` / `IMAGE` | `qwen38-flash` / `qwen38-flash-dgx` | Container / image names (`IMAGE` is not overwritten by serve.sh — point it at a backup tag to roll back) |
+| `EXTRA` | | Extra vLLM flags, passed verbatim |
+
+The launcher also fail-fasts on unedited `/path/to` placeholders or missing
+`MODEL_DIR`/`TABLE_DIR` *before* it removes a running container, and creates
+the container with a `/health` HEALTHCHECK (a 10-minute start period covers
+the weight load; 10 consecutive misses → `unhealthy` in `docker ps` — a
+restart on unhealthy needs an external watcher such as `willfarrell/autoheal`)
+and json-file log rotation. The bench and smoke-test scripts read `BASE` /
+`MODEL` / `PIN` / `API_KEY` from the environment (where applicable), so they
+work unchanged with a non-default port or with auth on.
+
+For graphs, scrape **two** endpoints: vLLM's own `/metrics` on `PORT` (request
+throughput, cache usage, queue time) and the engine-side sidecar on
+`METRICS_PORT` (default 18400) — PLE gather cost
+(`rate(vllm:ple_mmap_op_ms_total)/rate(vllm:ple_mmap_ops_total)` = ms/op), the
+mamba state-copy guard tripwire and the never-evict pin footprint. With the
+sidecar on, the `PLE mmap stats` log lines default off (`PLE_STATS_SEC=0`).
+
+## Limitations & notes
+
+- **One big model at a time** — and on a Spark the OS and GPU share the pool;
+  prefer the deterministic `GPU_MEM=0.01` + `KV_BYTES` sizing over a large
+  fraction (an OOM inside the unified pool can freeze the box).
+- **1M context is out of reach on one box**: the QSA layers refuse an fp8 KV
+  cache, and in bf16 a single 1M request needs ~30 GiB of KV. 500k with YaRN
+  was upstream's validated ceiling.
+- **Weights are not included** and the checkpoint carries Qwen's license (with
+  a MAU/revenue clause) — review it before production use.
+
+## What runs in what precision
+
+| Component | Precision | How |
+|---|---|---|
+| 512-expert MoE, 48 decoder layers | **int4** GPTQ-Marlin g128 | Intel checkpoint as-is |
+| MTP draft layer's 512-expert MoE (layer 48) | **int4** GPTQ-Marlin g128 RTN (default `-MTP_int4RTN` checkpoint) | Intel leaves layer 48 in bf16 (~4.7 GiB, `-:.*layers\.48\..*`); `tools/quantize_mtp_experts_int4.py` makes it int4 on the Marlin path: −3.5 GiB, +2–4% decode. The plain `-hybrid` checkpoint keeps them bf16 (boot log: `Using FlashInferExperts`) |
+| lm_head (shared with MTP draft head) | **int8** GPTQ-Marlin (uint8b128) | `tools/quantize_lm_head_int8.py` + `"lm_head": true` |
+| GDN in/out projections, QSA q/k/v/o, shared expert | **fp8** blockwise e4m3 (128×128) | `tools/fp8_convert.py` + `src/vllm_fp8_hybrid.py` |
+| Embeddings, hyper-connections, norms, MoE gates, fc_hidden | bf16 | excluded via `dynamic` rules |
+| PLE n-gram table (51B params, layer 1) | **fp8** rows, mmapped from disk | `tools/fetch-ple-table-fp8.sh` + the mmap patch |
+| KV cache | bf16 | QSA refuses fp8 KV |
+
+## The patches
+
+Everything is applied at image build time (see the `Dockerfile`); each patch is
+independent and gated by an env var where it changes behavior. The build is
+fail-fast — patch scripts assert their anchors, and a successful build prints
+one line per patch step (11 lines in total; SETUP-RU §2 lists them).
+
+### 1. PLE mmap upgrades (`src/vllm_ple_mmap.py`, extends upstream's patch)
+
+- **Any table dtype**: bf16/f16 tables and fp8 (with `weight_scale`) are all
+  accepted; row size is derived from the safetensors headers. The fp8 table
+  halves the bytes read per token vs bf16.
+- **`VLLM_PLE_MMAP_DIR`**: the table no longer has to live inside the
+  checkpoint dir — point it at any directory of safetensors shards (NFS, local
+  NVMe, a RAM-backed device...). The backend matters: the ~49 GiB table
+  outgrows what the page cache can keep warm next to the model, so gathers
+  cost ~1.3 ms/op from a RAM-backed source vs 5–9 ms from local NVMe vs
+  30–50 ms over NFS — decode impact in the appendix below.
+- **Hot path**: per-step dedup of row ids on CPU (`np.unique`), gather of
+  unique rows only, staging through a persistent pinned buffer with an async
+  H2D copy, and GPU-side expansion via the inverse index. A decode fast path
+  (`VLLM_PLE_MMAP_FAST_ROWS`, default 512) skips the thread pool entirely for
+  small gathers. Net effect: ~7.2 → ~2.5–3.8 ms per lookup op on a RAM-backed table.
+- **`VLLM_PLE_MMAP_MADV_RANDOM=1`**: `madvise(MADV_RANDOM)` the mmap so faults
+  stay single-page — for tables on remote RAM or boxes with no page-cache
+  headroom.
+- **Stats**: `VLLM_PLE_MMAP_STATS_SEC` (default 30) logs
+  `PLE mmap stats (last Ns): calls, op ms, gather ms, rows, MB` and resets the
+  counters each period.
+
+### 2. FLA shared-memory gate (`Dockerfile` sed)
+
+sm_121 reports 99 KiB of shared memory per block — the same as ADA, where the
+flash-linear-attention Triton kernels use their big GDN tiles — but the gate in
+`vllm/third_party/flash_linear_attention/ops/utils.py` demands 100 KiB, so all
+36 GDN layers silently fell back to small tiles. Lowering the gate to 99 KiB
+(101376) lets GB10 take the big-tile path. (Found the hard way in the
+Qwen3.5-122B Spark recipe — ported from
+[Entrpi/qwen3.5-122B-A10B-on-spark](https://github.com/Entrpi/qwen3.5-122B-A10B-on-spark)'s
+`patch_fla_shmem.py`.)
+
+The same build pass also pins `num_warps=2` in the chunked delta-rule state
+kernel (`chunk_delta_h.py`): with autotune free to pick 4, that kernel races
+on Blackwell — a `tl.dot` recurrence race yielding nondeterministic
+`h`/`v_new`, i.e. silently corrupt GDN state. The `USE_INITIAL_STATE` variant
+(the prefix-cache resume path) autotunes separately, so the corruption tracks
+cached-block requests
+([fla#953](https://github.com/fla-org/flash-linear-attention/issues/953)).
+
+### 3. int8 lm_head enablement (`Dockerfile` sed on `model.py` / `mtp.py`)
+
+Upstream constructs `ParallelLMHead` without `quant_config`, forcing a bf16
+head (1.27 GiB, and a bf16 GEMV per token over a 248320 vocab). One added
+kwarg in both the main model and the MTP draft lets the head pick up the
+checkpoint's int8 GPTQ packing. Without the `mtp.py` half, MTP ≥ 3 crashes at
+load ("no module or parameter named 'lm_head.qweight'").
+
+### 4. int4+fp8 hybrid dispatch (`src/vllm_fp8_hybrid.py`, `VLLM_FP8_HYBRID=1`)
+
+vLLM's GPTQ config quantizes listed layers and leaves the rest to
+`UnquantizedLinearMethod` — it has no notion of "this excluded layer is
+actually fp8 in the checkpoint". This shim wraps `AutoGPTQConfig`: it scans the
+checkpoint metadata for `F8_E4M3` weights with a `weight_scale_inv` sibling and
+routes exactly those layers to vLLM's blockwise-`Fp8Config`
+(`weight_block_size=[128,128]`, dynamic activation scheme) while everything
+else keeps the GPTQ path. `VLLM_USE_DEEP_GEMM=0` is required on sm_121
+(DeepGEMM hits `CUDA_ERROR_LAUNCH_FAILED`); the triton fallback is fine.
+
+### 5. Prefix caching: on, and fixed (`src/patch_mamba_align_split.py`)
+
+Upstream runs `--no-enable-prefix-caching` because of a CUBLAS error in the
+GDN `in_proj` GEMM on the cached-block path. With the fp8 side layers that
+GEMM runs a different kernel, and prefix caching is stable in our serving
+(`PREFIX_CACHE=1`).
+
+It also *works properly* now. On this hybrid model the reconciled cache hit is
+the **minimum across all KV cache groups** (full attention + four mamba/GDN
+state groups), and mamba "align" mode can only cache a state at a prefill
+chunk end on a 1600-token boundary. The image's scheduler aligned those chunk
+ends to `cache_config.block_size` — which the engine rewrites to the *minimum*
+group block size (8, the MTP draft granularity) — so chunks ended where no
+mamba state was cacheable, a cold request published **zero** reusable mamba
+states, and a repeated prompt only got fast on the **3rd** try (the miss
+triggers junction machinery that rebuilds the boundary one request late).
+Long prompts effectively never hit. The patch makes the split use
+`cache_config.mamba_block_size` (1600). Verified: an 8k-token repeat goes
+10.1 s → **0.90 s on the 2nd request**.
+
+The same rewritten `block_size` also poisoned the **worker** side: the
+align-mode state-slot seed (`mamba_hybrid.py`) divided by it too, so a prefix
+hit at 6400 tokens seeded state column 799 instead of 3, read past the
+block-table row and restored a wrong (often all-zero / stale) mamba state —
+greedy outputs visibly changed on cache hits. Root-caused upstream by
+[blazux](https://github.com/blazux/qwen3.8-Flash-DGX/issues/2#issuecomment-546252046)
+(his fix: `8347e7c`); the same one-line seed fix is folded into this patch.
+Verified: cold-vs-hit first-token logprobs now agree within the stack's
+normal run-to-run jitter (Marlin atomic-add nondeterminism), where before the
+fix greedy outputs diverged within the first few tokens.
+
+Notes: the prefix-cache granularity is large (1600 tokens; shorter prefixes
+get no reuse), and a repeat hit tops out at `round_down(P,1600) − 1600` — MTP
+(eagle-style) always recomputes the last matched block.
+
+### 6. Never-evict prompt pinning (`src/patch_never_evict.py`)
+
+`--never-evict-kv-cache-prompt-includes "<substring of your system prompt>"`
+pins the KV blocks of any prompt containing that marker: they are held in a
+side queue on `BlockPool`, excluded from the free count, and thus never handed
+out for eviction — your assistant's system prompt stays cached no matter what
+other traffic does. `--never-evict-kv-cache-max-fraction` (default 0.25) caps
+the pin. The pin set is *replaced* on each matching request, so an updated
+system prompt releases the old blocks automatically.
+
+Verified end-to-end: a pinned 8k prompt still answers in **0.94 s after 2M
+tokens of unique traffic** (3.1× full KV-pool turnover).
+
+Implementation notes: the marker is tokenized once and matched as a token-id
+subsequence (first/last token dropped — BPE merges at the boundaries); the pin
+is keyed on block *hashes*, not block ids, because this hybrid model frees
+mamba/GDN state blocks mid-request — each freed block is re-claimed by the pin
+the moment `free_blocks()` sees it. Only prefix-cacheable KV groups
+participate (the MTP draft layer's group is not, and must be skipped). This is
+a pin-only port of our `arc_pin2` patch from the Qwen3.5-122B Spark stack,
+which built the pin on top of the ARC GPU-eviction work in
+[vllm#40270](https://github.com/vllm-project/vllm/pull/40270); the ARC/2Q
+policies themselves were deliberately dropped — the stock free queue is
+C-speed on a path this model hits every step.
+
+Self-check (no GPU): `docker run --rm -v "$PWD/src:/t" --entrypoint python3
+qwen38-flash-dgx /t/test_never_evict_pin.py`.
+
+### 7. Mamba state-copy guard (`src/mamba_utils_guarded.py`)
+
+Hardens the align-mode state-copy kernels against the "CUDA illegal memory
+access / Xid 31 under load" crash class (also
+[blazux#2](https://github.com/blazux/qwen3.8-Flash-DGX/issues/2)): backports
+[vllm#50729](https://github.com/vllm-project/vllm/pull/50729) (overlapping
+state-copy race) and bounds-checks every block id against its state pool
+before dereferencing — an out-of-range id skips the copy and bumps a counter
+(logged as `mamba state-copy guard`) instead of taking down the CUDA context.
+
+With the block-size seed fix (patch 5) the out-of-range ids the guard was
+absorbing are gone at the root: the counter is expected to stay at **0**, and
+a nonzero count is logged as an *error* — it now indicates a new bug worth
+reporting, not a known quirk.
+
+### 8. Prefix-cache tracing (`src/patch_hit_debug.py`, `HIT_DEBUG=1`)
+
+Set `HIT_DEBUG=1` (→ `VLLM_HIT_DEBUG=1` in the container) to log, per request:
+the per-KV-group hit reconciliation (which group truncated the hit), mamba
+boundary-state publication (which slots were real/null/hashed), cached-block
+evictions, and prefill chunk-stop decisions. This is what found the bug in
+patch 5; costs nothing when off. `HIT_DEBUG_N=<k>` caps the total number of
+traced events and turns tracing off with a warning once the budget is spent —
+on 262k-token prompts the unbounded trace is a flood.
+
+### 9. On-demand step profiling (`src/patch_step_profile.py`, `STEP_PROFILE=1`)
+
+This vLLM build predates `VLLM_TORCH_PROFILER_DIR` and `/start_profile`. With
+`STEP_PROFILE=1`, `docker exec qwen38-flash touch /tmp/profile_trigger` makes
+the next 24 engine steps run under torch.profiler (CPU+CUDA) and writes a
+chrome trace to `/tmp/step_profile_<n>.json` — `docker cp` it out and open at
+ui.perfetto.dev. Old traces are pruned to the 3 newest; when idle the patch
+costs one `os.path.exists` per step.
+
+### 10. Private MTP draft head (`src/patch_mtp_draft_vocab.py`, `DRAFT_VOCAB` / `DRAFT_HEAD`)
+
+vLLM shares the target's lm_head with the MTP drafter, so every draft step reads
+the whole int8 head (616 MiB on a memory-bandwidth-bound decode step). Two
+independent knobs shrink that read; the target still verifies every drafted
+token, so outputs never change — only draft acceptance can (and therefore
+speed). `DRAFT_VOCAB` scores a private 65,536-row slice
+(`src/draft_vocab_65536.npy`; `tools/build_draft_vocab.py` rebuilds it over your
+own corpus) with every other id at −inf — the shipped set is English/code
+weighted, so CJK/ru-heavy traffic may prefer `0` or its own set.
+`DRAFT_HEAD=int4` builds a private int4 g128 RTN GPTQ-Marlin copy of the full
+head at first use. Inert unless the env vars are set. From upstream blazux
+`0c6df7e` (idea: MiaAI-Lab); adapted here for this fork's int8 GPTQ-Marlin head
+(rows are dequantized from the checkpoint's GPTQ tensors). Needs an image built
+with this section — the launcher probes for it and warns otherwise.
+
+### 11. Engine-side metrics sidecar (`src/vllm_custom_metrics.py`, `METRICS_PORT`)
+
+vLLM's own `/metrics` is served by the API-server process, which cannot see the
+EngineCore-side counters this fork cares about; plumbing them through the
+serialized `SchedulerStats` IPC would mean patching vLLM internals blindly. So
+the engine process serves them itself with `prometheus_client` (the library
+vLLM already uses) on its own port: `vllm:ple_mmap_*` (ops, op/gather ms, rows,
+bytes, prefetch hit/miss — `rate(op_ms)/rate(ops)` is ms/op), the
+`vllm:mamba_state_copy_guard_total` tripwire and the `vllm:never_evict_*` pin
+gauges. It starts lazily from the first data push (i.e. in the process that
+actually has data) and every failure is swallowed — telemetry never takes the
+server down. With it on, the `PLE mmap stats` log lines default off
+(`PLE_STATS_SEC=0`); on an image without the module the launcher keeps them at
+`30` instead of going silent.
+
+## Speculative decoding and TTFT
+
+MTP raises decode substantially but puts a floor (~0.8 s) under
+time-to-first-token: vLLM's v1 engine only emits the first token after the
+drafter has run, and MTP's draft layer is a stateful autoregressive
+transformer — on every prefill chunk it must run a full-chunk-width forward
+(always eager: above the cudagraph capture sizes) to sync its own KV/GDN
+state, plus k−1 sequential single-token passes. Cross-attention drafters like
+DFlash don't pay this, but Flash-Next has no such drafter — MTP is what ships
+in the checkpoint. If your workload is TTFT-sensitive, weigh `MTP` depth
+against `MTP=0`; only 0 removes the floor.
+
+## What's in here
+
+```
+Dockerfile                    official vLLM Flash-Next image + the patches above
+serve.sh                      example launcher config (edit paths, run)
+prepare.sh                    build the checkpoint + table from Intel's release
+src/vllm_ple_mmap.py          mmap PLE table (any dtype, relocatable dir, fast gather)
+src/vllm_custom_metrics.py    engine-side Prometheus sidecar: PLE/guard/pin gauges (METRICS_PORT)
+src/vllm_fp8_hybrid.py        int4+fp8 hybrid dispatch on the GPTQ config
+src/patch_never_evict.py      never-evict system-prompt KV pinning
+src/patch_mamba_align_split.py  prefix-cache chunk-alignment fix
+src/patch_hit_debug.py        prefix-cache tracing (VLLM_HIT_DEBUG)
+src/patch_step_profile.py     on-demand torch.profiler around engine steps (VLLM_STEP_PROFILE)
+src/patch_mtp_draft_vocab.py  private MTP draft head: reduced vocab and/or int4 (VLLM_MTP_DRAFT_VOCAB / VLLM_MTP_DRAFT_HEAD)
+src/draft_vocab_65536.npy     the 65,536-id draft vocabulary slice for the above
+src/mamba_utils_guarded.py    hardened align-mode state copy (vllm#50729 + guard)
+src/test_ple_mmap_cpu.py      CPU unit test for the gather (no GPU needed)
+src/test_custom_metrics_cpu.py  CPU unit test for the metrics sidecar (no GPU, no vLLM)
+src/test_never_evict_pin.py   CPU unit test for the pin (no GPU needed)
+scripts/serve-intel-ar.sh     the docker run behind serve.sh
+scripts/smoke-test.sh         health + coherence + prefill/decode numbers
+bench/decode_bench.py         batch-1 decode / TTFT / spec-acceptance bench
+bench/concurrency_bench.py    N-stream throughput / TTFT / queue-time bench
+tools/eval_quality.py         ppl + greedy-facts quality check against the API
+tools/quantize_mtp_experts_int4.py  int4 RTN the MTP draft experts -> the -MTP_int4RTN checkpoint variant
+tools/build_draft_vocab.py    rebuild draft_vocab_65536.npy over your own corpus
+tools/                        CPU-only checkpoint preparation
+docs/HOW-IT-WORKS.md          upstream's mmap-PLE story
+docs/OPTIMIZATIONS.md         stub (kept for old links; the recipe lives in this README)
+SETUP-RU.md                   step-by-step ops manual in Russian
+IMPROVEMENTS-RU.md            improvement backlog with statuses (fixes & development)
+```
+
+## Credits
+
+- Model: **Qwen team, Alibaba** — Qwen3.8-Flash-Next.
+- **This is a fork of [blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX)** —
+  the original mmap-PLE idea, the GB10 serving recipe, the NVFP4 path, and
+  docs/HOW-IT-WORKS.md are theirs.
+- int4 checkpoint this fork builds on: **[Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)**
+  (AutoRound); fp8 PLE table from **[Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)**.
+- Several pieces originate in the Qwen3.5-122B-A10B Spark recipes:
+  the int4 AutoRound + int8 lm_head serving approach from
+  **[albond/DGX_Spark_Qwen3.5-122B-A10B-AR-INT4](https://github.com/albond/DGX_Spark_Qwen3.5-122B-A10B-AR-INT4)**;
+  the FLA shared-memory gate fix and the int4+fp8 hybrid idea from
+  **[Entrpi/qwen3.5-122B-A10B-on-spark](https://github.com/Entrpi/qwen3.5-122B-A10B-on-spark)**.
+  The never-evict pin was built for that 122B stack on top of the ARC
+  GPU-eviction work in [vllm#40270](https://github.com/vllm-project/vllm/pull/40270)
+  and re-ported here.
+- Serving engine and base image: **vLLM** (`vllm/vllm-openai:qwen38-flash-next`,
+  the `release/qwen38next` recipe / PR #53896).
+- Independent reproduction of the upstream recipe, the native-offload fixes and
+  the concurrency measurements: **[@jschmied](https://github.com/jschmied)**
+  ([blazux#1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1),
+  [qwen38-flash-next-gb10](https://github.com/jschmied/qwen38-flash-next-gb10)).
+- License: [Apache-2.0](LICENSE).
+
+## Appendix: where to put the PLE table (and why not to bother with `PLE_PREFETCH`)
+
+Batch-1 decode bench (`bench/decode_bench.py`, medians of 3; W1 = fresh-prompt
+1000-token decode, W2 = pinned ~8k prefix hit + 256 tokens; DGX Spark GB10,
+MTP=3). Only the table location and the prefetch flag change between rows (all local NVMe is Gen 4):
+
+| table source              | prefetch | W1 tok/s | W2 tok/s | gather      |
+|---------------------------|----------|----------|----------|-------------|
+| RDMA row daemon           | on       | 42.4     | 47.8     | ~1.3 ms/op  |
+| RDMA row daemon           | off      | 41.6     | 46.7     | ~1.3 ms/op  |
+| local NVMe                | off      | 36.5     | 45.7     | 5–9 ms/op   |
+| local NVMe                | on       | 34.5     | 42.6     | 9–17 ms/op  |
+| local NVMe, warm cache    | on       | 33.4     | 41.5     | 9–16 ms/op  |
+| NFS (RDMA mount, btrfs)   | on       | 26.2     | 36.5     | 26–56 ms/op |
+| NFS (RDMA mount, btrfs)   | off      | 24.2     | 32.9     | 30–42 ms/op |
+
+Takeaways:
+
+- **Put the table on local NVMe.** It costs ~15% decode vs an exotic fast row
+  source, and it is the simple recipe. Serving straight off a NAS works but
+  costs ~40% (and that was NFS-over-RDMA to a btrfs box — a plain GbE NAS
+  will be worse).
+- **Don't bother with `PLE_PREFETCH=1`** (`VLLM_PLE_MMAP_PREFETCH`). The
+  batch-assembly prefetch only wins where the row source is very slow (NFS,
+  +2–3 tok/s, within run-to-run variance), is a wash on fast sources, and is
+  **net-negative on local NVMe**: the handoff/wait in `consume()` costs more
+  than the inline gather it replaces (confirmed on a warm page cache). It
+  stays experimental and default-off.
+- TTFT is unaffected by any of this (the MTP drafter floor dominates), and
+  between-restart variance on this bench is >10% — treat small deltas above
+  accordingly.
+
+About those "RDMA row daemon" rows: that is a custom one-sided RDMA READ
+server that pins the whole table in another box's RAM — the fastest row
+source measured, at the price of a second machine and an ibverbs science
+project. If you have a NAS with **≥64 GB of RAM** and a **≥100 Gbit RDMA
+link** to your Spark — and no second DGX Spark to put to better use — the
+[`magi` branch](../../tree/magi) ships the tool (`src/ple_rdma/`) and setup
+notes ("PLE table over RDMA"). Everyone else: local NVMe is the recipe.
