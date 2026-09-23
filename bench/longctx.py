@@ -11,10 +11,18 @@ the prefix cache cannot deduplicate them: you measure prefill cost and KV
 capacity, not cache hits. The prefix-cache hit counter is checked per row
 and a hit is reported loudly instead of being assumed away.
 
-What to expect on this stack: vLLM chunks prefill (8192 tokens per step,
-shared across requests), so N concurrent long prompts roughly cost N times
-one — TTFT grows linearly, s/stream stays flat. Two limits bend that line:
-  * --max-num-seqs (serve.sh SEQS, default 8): more streams queue ("queue").
+What to expect on this stack: vLLM chunks prefill (8192 tokens per step),
+and one long prefill fills that budget, so concurrent long prompts are
+prefilled one after another — TTFT grows linearly, s/stream stays flat, and
+the waiting shows up as "queue" (not scheduled yet) even below
+--max-num-seqs (serve.sh SEQS, default 8, the other reason to queue).
+
+KV capacity: with the default --gen 24 each request finishes right after its
+prefill and frees its KV before the next one is admitted, so total ctx can
+exceed the pool without preemption — that tests prefill, not capacity. To
+keep earlier streams resident while later ones prefill (a real capacity
+test), generate long enough to outlast the others' prefill, e.g. --gen 12000
+for 8 x 120k (~60 s of prefill each at ~2.1k tok/s). Limits:
   * the KV pool (serve.sh KV_BYTES; ~31 KB/token, so 30g ~ 966k tokens —
     the boot log prints "GPU KV cache size"): when N x ctx exceeds it, vLLM preempts running requests and
     recomputes them later ("preempt" > 0) — wall time jumps.
@@ -29,13 +37,13 @@ import common
 from common import chat, delta, metrics, unique_prompt
 
 
-def run_level(n, ctx):
+def run_level(n, ctx, gen):
     out, errors = [None] * n, []
     tag = uuid.uuid4().hex[:8]  # fresh per row: no cross-row reuse either
 
     def worker(i):
         try:
-            out[i] = chat(unique_prompt(f"{tag}-{i}", ctx), 24, stream=True)
+            out[i] = chat(unique_prompt(f"{tag}-{i}", ctx), gen, stream=True)
         except Exception as e:  # noqa: BLE001 - reported below
             errors.append(repr(e))
 
@@ -54,6 +62,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--ctx", type=int, default=80000,
                     help="approx. prompt tokens per stream (default 80000)")
+    ap.add_argument("--gen", type=int, default=24,
+                    help="tokens generated per stream (default 24; large = keep KV resident)")
     ap.add_argument("--streams", nargs="+", type=int, default=[1, 2, 4, 8],
                     help="concurrency levels (default: 1 2 4 8)")
     args = ap.parse_args()
@@ -67,7 +77,7 @@ def main():
     print("-" * 92)
 
     for n in args.streams:
-        done, errors, wall, m0, m1 = run_level(n, args.ctx)
+        done, errors, wall, m0, m1 = run_level(n, args.ctx, args.gen)
         if errors:
             print(f"{n:>7}  {len(errors)} request(s) failed, e.g. {errors[0][:120]}"
                   " — check `docker logs` (OOM / restart?)")

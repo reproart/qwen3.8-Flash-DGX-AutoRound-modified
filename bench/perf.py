@@ -137,7 +137,10 @@ def concurrency(levels, tokens=300):
         ttfts = [r["ttft"] for r in done if r["ttft"] is not None]
         q_sum, q_cnt = delta(m0, m1, "queue_sum"), delta(m0, m1, "queue_count")
         queue = q_sum / q_cnt if q_sum is not None and q_cnt else None
-        flag = "  <- queued: above --max-num-seqs" if queue is not None and queue > 0.5 else ""
+        # Waiting = not yet scheduled: either more streams than --max-num-seqs, or
+        # the per-step token budget (8192) taken by other requests' prefill.
+        flag = ("  <- queued (max-num-seqs / prefill budget)"
+                if queue is not None and queue > 0.5 else "")
         if agg > peak[1] and not flag:
             peak = (n, agg)
         print(f"   {n:>7} {wall:>8.1f} {agg:>7.1f} t/s {_fmt(_med(decode_rate(r) for r in done), '>9.1f')} t/s "
