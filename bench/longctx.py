@@ -17,7 +17,13 @@ prefilled one after another — TTFT grows linearly, s/stream stays flat, and
 the waiting shows up as "queue" (not scheduled yet) even below
 --max-num-seqs (serve.sh SEQS, default 8, the other reason to queue).
 
-KV capacity: by default each request answers "OK" right after its prefill
+KV capacity: vLLM only admits a request when its blocks fit, so a full pool
+shows up as fewer requests running at once (the rest wait in "queue"), rarely
+as preemption; the peak-usage line under each row turns that into a capacity
+estimate. On a GX10 at KV_BYTES=30g: 4 of 8 streams of ~127k ran at once at
+92% usage — ~0.55M tokens, well below the ~966k the boot log reports.
+
+By default each request answers "OK" right after its prefill
 and frees its KV before the next one is admitted, so total ctx can exceed the
 pool without preemption — that tests prefill, not capacity. --gen N forces
 exactly N generated tokens per stream (ignore_eos), so earlier streams stay
@@ -120,14 +126,18 @@ def main():
               f"{f(max(ttfts) if ttfts else None, '>8.1f')}s {wall / n:>8.1f}s "
               f"{f(queue, '>6.1f')}s {f(pre, '>8.0f')}")
         if "kv" in peak:
-            # Only meaningful when every stream was resident at the same time
-            # (--gen): then usage = their tokens / what the pool really holds.
-            tokens = total + sum(r["completion_tokens"] for r in done)
             line = (f"        peak KV pool usage {100 * peak['kv']:.1f}%, "
-                    f"up to {peak.get('running', '?')} requests running")
-            if peak.get("running") == n and peak["kv"] > 0.05:
-                line += (f" -> ~{tokens / 1e3:.0f}k tokens resident, so the pool holds "
-                         f"~{tokens / peak['kv'] / 1e6:.2f}M such tokens")
+                    f"up to {peak.get('running', '?')} of {n} requests running at once")
+            running = peak.get("running")
+            if running and peak["kv"] > 0.05:
+                # vLLM admits a request only when its blocks fit, so a full pool
+                # shows up as fewer running requests (the rest wait), not as
+                # preemption. Estimate from the peak: running streams of this
+                # size (prompt + generated; an upper bound — one may still be
+                # mid-prefill) over the usage they produced.
+                per = statistics.mean(r["prompt_tokens"] + r["completion_tokens"] for r in done)
+                line += (f" -> the pool holds ~{running / peak['kv']:.1f} streams of "
+                         f"~{per / 1e3:.0f}k (~{running * per / peak['kv'] / 1e6:.2f}M tokens)")
             print(line)
         if hits:
             print(f"        !! {hits:.0f} prefix-cache hit tokens on unique prompts — "
