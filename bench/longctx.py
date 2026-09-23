@@ -15,8 +15,8 @@ What to expect on this stack: vLLM chunks prefill (8192 tokens per step,
 shared across requests), so N concurrent long prompts roughly cost N times
 one — TTFT grows linearly, s/stream stays flat. Two limits bend that line:
   * --max-num-seqs (serve.sh SEQS, default 8): more streams queue ("queue").
-  * the KV pool (serve.sh KV_BYTES, default 20g: roughly 650-700k tokens at
-    ~30 KB/token): when N x ctx exceeds it, vLLM preempts running requests and
+  * the KV pool (serve.sh KV_BYTES; ~31 KB/token, so 30g ~ 966k tokens —
+    the boot log prints "GPU KV cache size"): when N x ctx exceeds it, vLLM preempts running requests and
     recomputes them later ("preempt" > 0) — wall time jumps.
 """
 import argparse
