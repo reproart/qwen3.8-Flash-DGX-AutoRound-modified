@@ -1,0 +1,8 @@
+# Correctness only: syntax errors and pyflakes (undefined names, unused
+# imports/variables, ...). Style is not enforced — the files mirror vLLM's
+# own code and upstream patches.
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = ["E9", "F"]

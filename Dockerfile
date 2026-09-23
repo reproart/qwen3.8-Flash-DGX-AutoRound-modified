@@ -114,8 +114,8 @@ RUN python3 /tmp/patch_step_profile.py && rm /tmp/patch_step_profile.py
 # corpus), every other id -inf. DRAFT_HEAD=int4: a private int4 g128 RTN GPTQ-Marlin
 # copy of the full-vocabulary head (vLLM marlin_quantize at first use). Rows are
 # dequantized from the checkpoint's GPTQ tensors (VLLM_MTP_DRAFT_VOCAB_CKPT, default
-# /model). Inert unless the env is set at runtime — with a pre-patch-14 image the
-# serve script's DRAFT_* knobs are silently ignored.
+# /model). Inert unless the env is set at runtime — on an image built before this
+# section the serve script's DRAFT_* knobs are ignored (the launcher warns).
 COPY src/draft_vocab_65536.npy /opt/llm/draft_vocab_65536.npy
 COPY src/patch_mtp_draft_vocab.py /tmp/patch_mtp_draft_vocab.py
 RUN python3 /tmp/patch_mtp_draft_vocab.py ${MTP_PY} && rm /tmp/patch_mtp_draft_vocab.py

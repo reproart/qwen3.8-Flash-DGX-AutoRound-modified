@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Scripts run inside Linux containers / on the Spark: never check out as CRLF
+# (a CRLF shebang or line breaks bash and python3 on Windows checkouts).
+*.sh   text eol=lf
+*.py   text eol=lf
+Dockerfile text eol=lf
+# Binary data
+*.npy  binary

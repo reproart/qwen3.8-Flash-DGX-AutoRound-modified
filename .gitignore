@@ -1,0 +1,18 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
+
+# Local artifacts (never commit weights, traces or bench dumps)
+*.safetensors
+*.bak
+step_profile_*.json
+report*.json

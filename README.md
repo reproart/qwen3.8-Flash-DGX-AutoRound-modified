@@ -47,8 +47,8 @@ on, `SEQS=8`). Single-stream decode by workload — reproduce with
 
 *Note: Values represent the arithmetic mean across all 6 benchmark runs (3 scripts × 2 runs each). The `±` values indicate the sample standard deviation.*
 
+### llama-benchy sweep (prefill `pp`, decode `tg`, at depth `d` and concurrency `c`)
 
-llama-benchy
 | model   |                  test |    t/s (total) |       t/s (req) |       peak t/s |   peak t/s (req) |             ttfr (ms) |          est_ppt (ms) |         e2e_ttft (ms) |
 |:--------|----------------------:|---------------:|----------------:|---------------:|-----------------:|----------------------:|----------------------:|----------------------:|
 | qwen    |           pp2048 (c1) | 978.53 ± 99.36 |  978.53 ± 99.36 |                |                  |      2118.24 ± 201.94 |      2114.45 ± 201.94 |      2118.24 ± 201.94 |
@@ -147,8 +147,8 @@ an aggregate number.
 ## Quickstart
 
 ```bash
-git clone https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound.git
-cd qwen3.8-Flash-DGX-AutoRound
+git clone https://github.com/reproart/qwen3.8-Flash-DGX-AutoRound-modified.git
+cd qwen3.8-Flash-DGX-AutoRound-modified
 
 docker build -t qwen38-flash-dgx .   # official image + this fork's patches
 
@@ -200,6 +200,12 @@ one script runs the whole pipeline (CPU-only — a NAS box is fine):
 ./prepare.sh /models/Qwen3.8-Flash-Next-W4A16-AutoRound /models/ple-table-fp8
 ```
 
+The script is resumable: if a step fails (network, disk), fix the cause and
+run the same command again — finished steps are skipped, and no tool ever
+re-quantizes its own output or overwrites a backup. The download also skips
+shards that hold only the n-gram table (they are dropped from the index in
+step 4 anyway) when the `huggingface_hub` Python package is importable.
+
 Step 1 verifies the download: every file the safetensors index references must
 be present, and the script stops with the missing file names if not. That check
 earns its keep — the public Intel repo currently lists 17 shards but serves no
@@ -239,10 +245,10 @@ or edit the paths in `serve.sh` (the example config used above) and run it.
 
 | Var | `serve.sh` default | Notes |
 |---|---|---|
-| `MODEL_DIR` / `TABLE_DIR` | `/path/to/...` — edit these | Prepared checkpoint / fp8 PLE table dirs |
+| `MODEL_DIR` / `TABLE_DIR` | `/models/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN` / `/models/ple-table-fp8` — edit to your paths | Prepared checkpoint / fp8 PLE table dirs (must exist; the launcher checks before touching the running container) |
 | `PORT` | `8000` | API port (bare script: `18300`) |
 | `CTX` | `262144` | Max context |
-| `YARN` | `0` | `1` + `CTX=500000` — 500k context via YaRN rope scaling (upstream-validated ceiling; the launcher pins the draft model's length so MTP boots — SETUP-RU §7.2) |
+| `YARN` | `0` | `1` + `CTX=500000` — 500k context via YaRN rope scaling (upstream-validated ceiling; the launcher pins the draft model's length so MTP boots) |
 | `SEQS` | `8` | Max concurrent sequences (don't benchmark with 1–2, see below) |
 | `GPU_MEM` | `0.01` | Near-zero pool fraction, paired with `KV_BYTES`: deterministic sizing, so the driver never oversubscribes the unified pool (`NV_ERR_NO_MEMORY` / Xid 31 freezes). Bare script: a `0.85` fraction — avoid on unified-memory boxes. |
 | `KV_BYTES` | `20g` | Explicit KV pool size, passed as `--kv-cache-memory-bytes` (bare script: unset) |
@@ -250,8 +256,9 @@ or edit the paths in `serve.sh` (the example config used above) and run it.
 | `DRAFT_VOCAB` | `1` | The MTP drafter scores only the 65,536 most frequent tokens instead of all 248,320 (private draft-head patch, from upstream blazux): +3–5% decode on English/code. The shipped id set is English/code-weighted — CJK/ru-heavy traffic may prefer `0` (full vocab) or a custom set built with `tools/build_draft_vocab.py` (a custom `ids.npy` must live inside the checkpoint dir and be passed as `/model/<name>.npy` — those are the only paths the container sees). **Needs an image rebuilt with the Dockerfile's draft-head section — the launcher probes the image and warns loudly when it predates the patch (the env is then ignored by vLLM)** |
 | `DRAFT_HEAD` | `int8` | `int4` = a private int4 g128 RTN Marlin copy of the full-vocabulary head (~320 MB vs 616 MiB read per draft step, no vocabulary restriction). Measured a wash upstream (acceptance 1–8 points lower), so the shared int8 head stays the default. Same image requirement/warning as `DRAFT_VOCAB` |
 | `PREFIX_CACHE` | `1` | Prefix caching — fixed and recommended on this fork (bare script: `0`) |
-| `PIN_PROMPT` / `PIN_MAX_FRACTION` | unset / `0.25` | Never-evict pin (patch 6); needs `PREFIX_CACHE=1` |
+| `PIN_PROMPT` / `PIN_MAX_FRACTION` | unset / `0.25` | Never-evict pin (patch 6); needs `PREFIX_CACHE=1` (the launcher warns otherwise). Use a distinctive substring of a few dozen characters — a word or two matches unrelated prompts |
 | `API_KEY` | unset | Non-empty → Bearer auth on the API (vLLM `--api-key`; generate with `openssl rand -hex 32`). `/health` stays open; the key is visible in `docker inspect` |
+| `BIND_ADDR` | unset | Host address for the published ports. Unset = all interfaces; `127.0.0.1` = this machine only (e.g. behind a reverse proxy). The metrics sidecar has no auth even with `API_KEY` |
 | `FP8_HYBRID` | `1` | int4+fp8 hybrid dispatch (patch 4) |
 | `PLE_MADV_RANDOM` | `1` | `MADV_RANDOM` on the table mmap (patch 1): no readahead around 160-byte row faults — upstream measured 4–8% faster cold prefill; `0` = kernel readahead (try when the table sits on remote RAM with no page-cache headroom) |
 | `METRICS_PORT` | `18400` | Engine-side Prometheus sidecar (`src/vllm_custom_metrics.py`): `vllm:ple_mmap_*` counters (ops, op/gather ms, rows, bytes, prefetch hit/miss), `vllm:mamba_state_copy_guard_total` (tripwire, expect 0) and `vllm:never_evict_{blocks_reserved,pin_queue_blocks,pin_bytes}` gauges. vLLM's own `/metrics` runs in the API-server process and cannot see EngineCore counters, so these are served from the engine process on this separate port; `0` = off. The launcher probes the image for both the module and its start hooks, and warns when the sidecar cannot come up (the port would just stay closed) |
@@ -279,7 +286,10 @@ the weight load; 10 consecutive misses → `unhealthy` in `docker ps` — a
 restart on unhealthy needs an external watcher such as `willfarrell/autoheal`)
 and json-file log rotation. The bench and smoke-test scripts read `BASE` /
 `MODEL` / `PIN` / `API_KEY` from the environment (where applicable), so they
-work unchanged with a non-default port or with auth on.
+work unchanged with a non-default port or with auth on. Their defaults match
+`serve.sh` (`http://localhost:8000`, model `qwen`); `scripts/smoke-test.sh`
+also takes `host:port` as its argument and, without `MODEL`, uses whatever
+`/v1/models` reports.
 
 For graphs, scrape **two** endpoints: vLLM's own `/metrics` on `PORT` (request
 throughput, cache usage, queue time) and the engine-side sidecar on
@@ -316,7 +326,12 @@ sidecar on, the `PLE mmap stats` log lines default off (`PLE_STATS_SEC=0`).
 Everything is applied at image build time (see the `Dockerfile`); each patch is
 independent and gated by an env var where it changes behavior. The build is
 fail-fast — patch scripts assert their anchors, and a successful build prints
-one line per patch step (11 lines in total; SETUP-RU §2 lists them).
+one confirmation per patch step: `ple_layer.py patched OK`, `fla shmem gate
+patched`, `fla num_warps pinned`, `auto_gptq.py patched OK`, `never-evict pin
+patched OK`, `lm_head patched OK in model.py + mtp.py` (after two `grep -c`
+counts of `1`), `mamba_utils.py guarded OK`, `patch_hit_debug.py applied OK`,
+`patch_mamba_align_split.py applied OK`, `patch_step_profile.py applied OK` and
+`draft-head hook INSTALLED`. A missing line means that step did not run.
 
 ### 1. PLE mmap upgrades (`src/vllm_ple_mmap.py`, extends upstream's patch)
 
@@ -548,8 +563,8 @@ tools/build_draft_vocab.py    rebuild draft_vocab_65536.npy over your own corpus
 tools/                        CPU-only checkpoint preparation
 docs/HOW-IT-WORKS.md          upstream's mmap-PLE story
 docs/OPTIMIZATIONS.md         stub (kept for old links; the recipe lives in this README)
-SETUP-RU.md                   step-by-step ops manual in Russian
-IMPROVEMENTS-RU.md            improvement backlog with statuses (fixes & development)
+tools/test_tools_cpu.py       CPU test for the preparation tools (correctness, safe re-runs)
+.github/workflows/ci.yml      CI: shellcheck, ruff, the CPU tests
 ```
 
 ## Credits

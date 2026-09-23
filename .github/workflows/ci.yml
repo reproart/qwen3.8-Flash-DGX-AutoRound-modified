@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff shellcheck-py
+      - name: ruff (syntax + pyflakes, see ruff.toml)
+        run: ruff check .
+      - name: shellcheck
+        run: shellcheck $(git ls-files '*.sh')
+
+  cpu-tests:
+    # Everything that runs without a GPU and without the vLLM image.
+    # (src/test_never_evict_pin.py needs vLLM: run it inside the built image.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - run: pip install numpy safetensors prometheus_client
+      - name: PLE mmap gather
+        run: python src/test_ple_mmap_cpu.py
+      - name: metrics sidecar
+        run: python src/test_custom_metrics_cpu.py
+      - name: checkpoint preparation tools
+        run: python tools/test_tools_cpu.py
