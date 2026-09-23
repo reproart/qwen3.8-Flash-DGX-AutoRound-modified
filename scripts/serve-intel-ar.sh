@@ -112,6 +112,24 @@ case "$DRAFT_VOCAB" in
   *) MTENV+=(-e VLLM_MTP_DRAFT_VOCAB="$DRAFT_VOCAB") ;;
 esac
 
+# QSA top-k (the sparse-attention block selection). The stock persistent_topk
+# kernel is non-deterministic on GB10 and can drop real candidates (vllm#51782).
+# DET_TOPK=1 (default): @jschmied's deterministic kernel (Dockerfile, vllm#55122)
+#   — deterministic at full prefill speed.
+# EXACT_TOPK=1: exact torch.topk fallback (deterministic, -20-40% long prefill);
+#   wins over DET_TOPK. EXACT_TOPK=fill: -inf-fill unwritten columns, then the
+#   stock kernel (a diagnostic). Both 0 = stock kernel.
+DET_TOPK="${DET_TOPK:-1}"
+EXACT_TOPK="${EXACT_TOPK:-0}"
+[ "$DET_TOPK" = 1 ] && MTENV+=(-e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so)
+[ "$EXACT_TOPK" != 0 ] && MTENV+=(-e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK")
+
+# ITER_DETAILS=1: per-step prefill metrics (vllm:scheduled_ctx_tokens_total on
+# vLLM's /metrics; live prefill tok/s via bench/ppwatch.sh). Needs the image's
+# prefill-metrics patch — on an older image the stock flag logs one INFO line
+# per engine step instead, so the launcher refuses to pass it there.
+ITER_DETAILS="${ITER_DETAILS:-0}"
+
 # Engine-side metrics sidecar (vllm_custom_metrics, image module): PLE gather
 # counters, the mamba state-copy guard tripwire and the never-evict pin gauges.
 # vLLM's own /metrics lives in the API-server process and cannot see
@@ -176,7 +194,7 @@ done
 #   metrics — the vllm_custom_metrics module: the engine-side metrics sidecar.
 #             Without it PLE stats are neither served nor logged unless
 #             PLE_STATS_SEC brings the log lines back (handled below).
-IMAGE_OK=1 DRAFT_OK=0 METRICS_OK=0
+IMAGE_OK=1 DRAFT_OK=0 METRICS_OK=0 DET_OK=0 EXACT_OK=0 ITER_OK=0
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   IMAGE_OK=0  # the main `docker run` fails loudly on its own; don't add noise
 else
@@ -186,21 +204,28 @@ print("draft", int(os.path.exists("/opt/llm/draft_vocab_65536.npy")))
 # The sidecar needs the module AND both start hooks (the PLE module kicks it on
 # the first stats push; the scheduler init is the one that always runs). A
 # module without hooks starts nothing and says nothing — probe for the pair.
+def has(path, needle):
+    try:
+        return needle in open(path, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return False
 spec = u.find_spec("vllm")
-ok = u.find_spec("vllm_custom_metrics") is not None and spec is not None
-if ok:
-    pkg = os.path.dirname(spec.origin)
-    def has(path, needle):
-        try:
-            return needle in open(path, encoding="utf-8", errors="ignore").read()
-        except OSError:
-            return False
-    ok = (has(os.path.join(pkg, "v1/core/sched/scheduler.py"), "set_pin_source")
-          and has(os.path.join(os.path.dirname(pkg), "vllm_ple_mmap.py"), "_metrics_start"))
+pkg = os.path.dirname(spec.origin) if spec is not None else ""
+ok = (spec is not None and u.find_spec("vllm_custom_metrics") is not None
+      and has(os.path.join(pkg, "v1/core/sched/scheduler.py"), "set_pin_source")
+      and has(os.path.join(os.path.dirname(pkg), "vllm_ple_mmap.py"), "_metrics_start"))
 print("metrics", int(ok))
+if spec is not None:
+    qsa = os.path.join(pkg, "models/qwen3_8_flash_next/nvidia/ops/qsa.py")
+    print("det", int(os.path.exists("/opt/llm/kernel-det/_C_det.so") and has(qsa, "QSADET")))
+    print("exact", int(has(qsa, "_qsa_exact_topk")))
+    print("iter", int(has(os.path.join(pkg, "v1/metrics/loggers.py"), "_q38_prefill_metrics")))
 ' 2>/dev/null) || probe=""
   case "$probe" in *"draft 1"*) DRAFT_OK=1 ;; esac
   case "$probe" in *"metrics 1"*) METRICS_OK=1 ;; esac
+  case "$probe" in *"det 1"*) DET_OK=1 ;; esac
+  case "$probe" in *"exact 1"*) EXACT_OK=1 ;; esac
+  case "$probe" in *"iter 1"*) ITER_OK=1 ;; esac
   if [ -z "$probe" ]; then
     IMAGE_OK=0
     echo "WARNING: could not probe '$IMAGE' (python3/entrypoint missing?) — skipping patch checks." >&2
@@ -213,6 +238,23 @@ if [ "$IMAGE_OK" = 1 ] && [ "$DRAFT_OK" = 0 ] \
   echo "  image '$IMAGE' predates the Dockerfile draft-head section (no /opt/llm/draft_vocab_65536.npy)." >&2
   echo "  The server still runs correctly (full-vocabulary int8 draft head), just without the speedup." >&2
   echo "  To enable: docker build -t '$IMAGE' .  (layer cache keeps it quick; the ~20 GiB base is not re-downloaded)." >&2
+fi
+
+if [ "$IMAGE_OK" = 1 ] && [ "$DET_TOPK" = 1 ] && [ "$DET_OK" = 0 ] && [ "$EXACT_TOPK" = 0 ]; then
+  echo "WARNING: DET_TOPK=1 will be IGNORED: image '$IMAGE' has no deterministic QSA top-k kernel" >&2
+  echo "  (/opt/llm/kernel-det/_C_det.so + qsa.py wiring). The stock, non-deterministic kernel runs" >&2
+  echo "  (vllm#51782). Rebuild: docker build -t '$IMAGE' .  — or EXACT_TOPK=1 on an image that has it." >&2
+fi
+if [ "$IMAGE_OK" = 1 ] && [ "$EXACT_TOPK" != 0 ] && [ "$EXACT_OK" = 0 ]; then
+  echo "WARNING: EXACT_TOPK=$EXACT_TOPK will be IGNORED: image '$IMAGE' predates the exact QSA top-k patch. Rebuild." >&2
+fi
+if [ "$ITER_DETAILS" = 1 ]; then
+  if [ "$ITER_OK" = 1 ] || [ "$IMAGE_OK" = 0 ]; then
+    EXTRA="--enable-logging-iteration-details $EXTRA"
+  else
+    echo "WARNING: ITER_DETAILS=1 not applied: image '$IMAGE' lacks the prefill-metrics patch (the stock" >&2
+    echo "  flag would log a line per engine step). Rebuild: docker build -t '$IMAGE' ." >&2
+  fi
 fi
 
 # Wire up the metrics sidecar now that the image has been probed: publish the
@@ -283,5 +325,5 @@ docker run -d --name "$NAME" --restart "${RESTART:-unless-stopped}" \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" --reasoning-parser qwen3 \
     ${PIN_ARG[@]+"${PIN_ARG[@]}"} ${SPEC[@]+"${SPEC[@]}"}
 
-echo ">> $NAME starting on ${BIND_ADDR:-0.0.0.0}:$PORT (ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, gpu_mem=$GPU_MEM, draft_vocab=$DRAFT_VOCAB, draft_head=$DRAFT_HEAD, metrics=$METRICS_PORT)"
+echo ">> $NAME starting on ${BIND_ADDR:-0.0.0.0}:$PORT (ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, gpu_mem=$GPU_MEM, draft_vocab=$DRAFT_VOCAB, draft_head=$DRAFT_HEAD, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, metrics=$METRICS_PORT)"
 echo ">> follow with: docker logs -f $NAME"

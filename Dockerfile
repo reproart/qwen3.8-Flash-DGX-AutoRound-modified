@@ -16,6 +16,7 @@ FROM vllm/vllm-openai:qwen38-flash-next@sha256:fc120ece0a388cc0aa1caad4a9f1cd921
 # numpy 2.2.6 — the patch needs numpy, already present).
 ARG SP=/usr/local/lib/python3.12/dist-packages
 ARG PLE=${SP}/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+ARG QSA_OPS=${SP}/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
 
 COPY src/vllm_ple_mmap.py ${SP}/vllm_ple_mmap.py
 # Engine-side Prometheus sidecar: PLE gather counters, the mamba state-copy
@@ -99,10 +100,52 @@ RUN python3 /tmp/patch_hit_debug.py && rm /tmp/patch_hit_debug.py
 COPY src/patch_mamba_align_split.py /tmp/patch_mamba_align_split.py
 RUN python3 /tmp/patch_mamba_align_split.py && rm /tmp/patch_mamba_align_split.py
 
+# Exact QSA top-k (VLLM_QSA_EXACT_TOPK=1|fill), from upstream blazux/qwen3.8-Flash-DGX
+# (8347e7c) via Saren-Arterius/qwen3.8-Flash-DGX-AutoRound. The stock persistent_topk
+# kernel is non-deterministic on GB10 and can drop real top-k candidates (vllm#51782;
+# reported by @k3dani, blazux#3). The exact path uses torch.topk over the visible
+# columns: deterministic, but -20-40% long prefill. Superseded by the kernel below,
+# kept as the fallback (wins over it when set). Inert unless the env is set.
+COPY src/patch_qsa_exact_topk.py /tmp/patch_qsa_exact_topk.py
+RUN python3 /tmp/patch_qsa_exact_topk.py ${QSA_OPS} && rm /tmp/patch_qsa_exact_topk.py
+
+# Deterministic persistent_topk kernel (VLLM_QSA_DET_TOPK=1, the serve default):
+# @jschmied's fix for the same bug at kernel speed (upstream as vllm#55122), built
+# here as a standalone extension (_C_det.so) with the image's nvcc — no vLLM rebuild.
+# Upstream measured on a GX10, vs the exact path: 8k 1,476 -> 2,488 tok/s, 32k
+# 1,794 -> 2,996, decode unchanged. Wiring and pins from Saren-Arterius/
+# qwen3.8-Flash-DGX-AutoRound (blazux 4b723de; pin bumped in 0022e36 by @jschmied:
+# signed-zero canonicalisation, deterministic low-shared-memory fallback, launcher
+# chunk sizing for 24576/49152-wide rows). Sources fetched from
+# https://github.com/jschmied/qwen38-flash-next-gb10 at a pinned commit AND sha256
+# (Apache-2.0; attribution: @jschmied). ADD --checksum needs BuildKit (the default
+# since Docker 23). DET_ARCH=120a for x86 Blackwell (RTX 5090).
+ARG KDET_SHA=e0ef69d4f5575dad00d34e05479eaf4c6547bace
+ARG KDET=https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KDET_SHA}
+ARG DET_ARCH=121a
+ADD --checksum=sha256:138cacfc5eb117f0922d53c88727e4d0dc26dcfb246c3d401fc280cfc726cc71 ${KDET}/patches/kernel-det/build_det.py /opt/llm/kernel-det/src/build_det.py
+ADD --checksum=sha256:b103fbeaf7589b9468471142ad0b30012a076f93d20ba11fc5ff6dcb1ecd32a6 ${KDET}/patches/kernel-det/bindings_det.cpp /opt/llm/kernel-det/src/bindings_det.cpp
+ADD --checksum=sha256:19e1d53425ea9a839445722fd1dac1c41727128eebdce84508c1bfb8592afecf ${KDET}/patches/kernel-det/topk_det.cu /opt/llm/kernel-det/src/topk_det.cu
+ADD --checksum=sha256:16939700ae389750782ff5c0d5b9caef59aa0ff8b869b64ec94fa72c814910ee ${KDET}/patches/kernel-det/torch_utils.h /opt/llm/kernel-det/src/torch_utils.h
+ADD --checksum=sha256:b4ef9ce298d43d6c0e6db9fcca451df20815b2cfe33791919c1ad9c0e84f0ba7 ${KDET}/patches/kernel-det/persistent_topk.cuh /opt/llm/kernel-det/src/persistent_topk.cuh
+ADD --checksum=sha256:70905073fe3fa361030bf1cb469b74610766bdfe361419cd7df50af2561322e3 ${KDET}/tools/determinism/qsadet_patch.py /tmp/qsadet_patch.py
+RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_ARCH=${DET_ARCH} python3 build_det.py 2>&1 | tail -2 \
+ && cp /opt/llm/kernel-det/build/_C_det.so /opt/llm/kernel-det/_C_det.so \
+ && VLLM_QSA_PY=${QSA_OPS} python3 /tmp/qsadet_patch.py && rm /tmp/qsadet_patch.py \
+ && python3 -c "import ast; ast.parse(open('${QSA_OPS}').read()); print('qsadet wired OK')"
+
 # On-demand torch.profiler around engine steps (VLLM_STEP_PROFILE=1 +
 # touch /tmp/profile_trigger). This vLLM predates VLLM_TORCH_PROFILER_DIR.
 COPY src/patch_step_profile.py /tmp/patch_step_profile.py
 RUN python3 /tmp/patch_step_profile.py && rm /tmp/patch_step_profile.py
+
+# Per-step prefill metrics (--enable-logging-iteration-details; ITER_DETAILS=1 in the
+# launcher), from Saren-Arterius/qwen3.8-Flash-DGX-AutoRound. vllm:prompt_tokens_total
+# is credited only when a prefill FINISHES; this adds vllm:scheduled_ctx_tokens_total
+# (+ scheduled_iterations_total) fed every engine step, and mutes the stock
+# one-line-per-step logger. Watch live prefill tok/s with bench/ppwatch.sh.
+COPY src/patch_prefill_metrics.py /tmp/patch_prefill_metrics.py
+RUN python3 /tmp/patch_prefill_metrics.py && rm /tmp/patch_prefill_metrics.py
 
 # Private MTP draft head (VLLM_MTP_DRAFT_VOCAB=<ids.npy>, VLLM_MTP_DRAFT_HEAD=int4),
 # from upstream blazux/qwen3.8-Flash-DGX 0c6df7e (idea: MiaAI-Lab, reimplemented there),

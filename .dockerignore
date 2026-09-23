@@ -1,0 +1,7 @@
+docs/
+scripts/
+bench/
+tools/
+.github/
+*.md
+.git/

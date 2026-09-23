@@ -24,7 +24,8 @@ jobs:
 
   cpu-tests:
     # Everything that runs without a GPU and without the vLLM image.
-    # (src/test_never_evict_pin.py needs vLLM: run it inside the built image.)
+    # (src/test_never_evict_pin.py and src/test_prefill_metrics_cpu.py need
+    # vLLM: run them inside the built image.)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,3 +40,5 @@ jobs:
         run: python src/test_custom_metrics_cpu.py
       - name: checkpoint preparation tools
         run: python tools/test_tools_cpu.py
+      - name: exact QSA top-k helpers
+        run: python src/test_qsa_exact_topk_cpu.py

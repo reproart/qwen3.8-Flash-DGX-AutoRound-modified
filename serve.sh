@@ -61,6 +61,17 @@ export RESTART=unless-stopped
 # table sits on remote RAM with no page-cache headroom).
 export PLE_MADV_RANDOM=1
 
+# QSA top-k (sparse-attention block selection): the stock kernel is
+# non-deterministic on GB10 and can drop candidates (vllm#51782).
+# DET_TOPK=1 = @jschmied's deterministic kernel at full speed (default);
+# EXACT_TOPK=1 = exact torch.topk fallback (slower long prefill, wins when set).
+export DET_TOPK=1
+export EXACT_TOPK=0
+
+# Per-step prefill metrics on vLLM's /metrics (vllm:scheduled_ctx_tokens_total;
+# watch live prefill tok/s with bench/ppwatch.sh). 0 = off.
+export ITER_DETAILS=0
+
 # Engine-side metrics sidecar port (PLE gather counters, the mamba guard
 # tripwire, the never-evict pin gauges — vllm_custom_metrics): served from the
 # engine process on its own endpoint, because vLLM's /metrics in the API
