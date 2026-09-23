@@ -1176,8 +1176,9 @@ class MambaSpecDecodeGPUContext:
                 # blazux/qwen3.8-Flash-DGX#2 / 8347e7c): the guard is now a
                 # tripwire, any hit indicates a NEW bug worth reporting.
                 logger.error(
-                    "mamba state-copy guard: %d out-of-range block id(s) "
-                    "skipped (would have been an illegal memory access). "
+                    "mamba state-copy guard: %d out-of-range state copies "
+                    "skipped (counted per copy tile, would have been an "
+                    "illegal memory access). "
                     "Expected 0 since the mamba block-size seed fix - "
                     "this indicates a new bug, please report it.",
                     hits,

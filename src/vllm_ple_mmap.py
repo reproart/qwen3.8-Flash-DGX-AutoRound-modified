@@ -1,17 +1,18 @@
 """vllm_ple_mmap — serve the Qwen3.8-Flash-Next N-gram (PLE) table from NVMe via mmap.
 
-Why: the 51B-parameter n-gram table is 44 GiB in FP8 and vLLM keeps it resident
-(GPU, or pinned host RAM with VLLM_PLE_CPU_OFFLOAD). On a DGX Spark / GX10 the
-host and the GPU share one 121 GiB pool, so neither fits next to the 78 GiB main
-model. But a token only ever touches 16 rows x 160 bytes of that table, so the
-table can live on disk and be served through the page cache — exactly what
-llama.cpp does with its GGUF mmap.
+Why: the 51B-parameter n-gram table is ~49 GiB in FP8 (~95 GiB bf16) and vLLM
+keeps it resident (GPU, or pinned host RAM with VLLM_PLE_CPU_OFFLOAD). On a DGX
+Spark / GX10 the host and the GPU share one ~121 GiB pool, so it does not fit
+next to the main model. But a token only ever touches 16 rows x 160 bytes of
+that table, so the table can live on disk and be served through the page cache
+— exactly what llama.cpp does with its GGUF mmap.
 
 How: with VLLM_PLE_MMAP=1 this module patches ``Qwen3_8FlashNextNGramEmbedding``:
-  * ``__init__`` swaps the 44/95 GiB ``VocabParallelEmbedding`` for a tiny
+  * ``__init__`` swaps the full-size ``VocabParallelEmbedding`` for a tiny
     placeholder whose ``forward(ids)`` gathers rows from ``np.memmap`` views of the
-    checkpoint's ``model-plefp8-*.safetensors`` shards (zero-copy, page-cache backed);
-  * ``load_weights`` drops the 128 shard tensors on the floor, keeps the global FP8
+    table's safetensors shards (zero-copy, page-cache backed) — found under
+    ``VLLM_PLE_MMAP_DIR`` if set, else in the checkpoint dir;
+  * ``load_weights`` drops the shard tensors on the floor, keeps the global FP8
     ``weight_scale`` (as ``_offload_weight_scale``, which the untouched
     ``Qwen3_8FlashNextPLELayer._dequantize_embeddings`` already consumes) and opens
     the memmaps.
@@ -21,7 +22,7 @@ How: with VLLM_PLE_MMAP=1 this module patches ``Qwen3_8FlashNextNGramEmbedding``
     be listed in ``-cc.splitting_ops`` and run OUTSIDE piecewise CUDA graphs: the
     gather is CPU work + a pageable H2D copy, which cannot live inside a capture.
     Use ``-cc.cudagraph_mode=PIECEWISE`` (not FULL*) with the splitting op list in
-    serve-flashnext-vllm.sh, or ``--enforce-eager``.
+    scripts/serve-intel-ar.sh, or ``--enforce-eager``.
 Nothing else in vLLM changes: the n-gram hashing, the short-conv, the dequant path
 are the stock ones.
 
@@ -31,12 +32,17 @@ Knobs (env):
   VLLM_PLE_MMAP_CHUNK=2048   rows per gather task
   VLLM_PLE_MMAP_PREWARM=0    1 = stream the whole table once at load to fill the
                              page cache with whatever memory is free (harmless,
-                             evictable; ~10 s at 4.7 GB/s)
+                             evictable). The launcher sets 1.
   VLLM_PLE_MMAP_PREFETCH=0   EXPERIMENTAL: 1 = run the n-gram hash at batch
                              assembly and gather rows in a worker thread, so
                              the mid-layer-1 lookup op only copies ready rows
                              (hides the page-fault latency behind layer-0
                              compute). Off by default; lightly tested.
+  VLLM_PLE_MMAP_DIR          table directory (default: the checkpoint dir)
+  VLLM_PLE_MMAP_MADV_RANDOM=0  1 = madvise(MADV_RANDOM) the mappings (the
+                             launcher sets 1)
+  VLLM_PLE_MMAP_FAST_ROWS=512  gathers up to this many rows skip the pool
+  VLLM_PLE_MMAP_STATS_SEC=30 stats log period (0 = off)
 
 Install: the Dockerfile copies this file next to vllm and appends
 ``_ple_mmap_apply(Qwen3_8FlashNextNGramEmbedding)`` to the end of
@@ -131,8 +137,8 @@ class MmapPleTable:
         # Worth it when the table can't fit in page cache (e.g. remote-RAM
         # backing on a memory-tight box) — each miss then pulls one page
         # instead of a readahead window of mostly-evicted-later pages.
-        # Default off: with local NVMe and cache headroom, readahead helps.
-        # Note it also makes VLLM_PLE_MMAP_PREWARM's sequential pass slower.
+        # Module default off; scripts/serve-intel-ar.sh turns it on (upstream
+        # measured 4-8% faster cold prefill). Note it also makes VLLM_PLE_MMAP_PREWARM's sequential pass slower.
         madv_random = _env_int("VLLM_PLE_MMAP_MADV_RANDOM", 0)
         for idx, (path, offset, rows) in shards.items():
             self.paths[idx] = path
@@ -180,8 +186,11 @@ class MmapPleTable:
             local = ids - shard * self.shard_size
             out = np.empty((ids.size, self.row_bytes), dtype=np.uint8)
             for si in np.unique(shard):
+                mm = self.mm[si]
+                if mm is None:
+                    raise IndexError(f"PLE shard {si} missing")
                 mask = shard == si
-                out[mask] = self.mm[si][local[mask]]
+                out[mask] = mm[local[mask]]
             return out
         # Dedupe + sort: repeated n-grams are common, and sorted rows improve
         # locality inside a shard. already_unique skips the second sort when
@@ -764,6 +773,17 @@ def apply(cls: type) -> None:
                     "_offload_weight_scale",
                     _read_scale(scale_entry).to(torch.accelerator.current_accelerator()),
                     persistent=False,
+                )
+            # Every part must be present: a missing shard would otherwise only
+            # surface mid-serving, as a TypeError on the first row id that
+            # lands in it (mm[si] is None), taking the engine down.
+            missing = sorted(set(range(parts)) - set(shards))
+            extra = sorted(set(shards) - set(range(parts)))
+            if missing or extra:
+                raise RuntimeError(
+                    f"PLE mmap: table under {model_path} is incomplete — expected "
+                    f"shards 0..{parts - 1}, missing {missing[:16]}"
+                    f"{'...' if len(missing) > 16 else ''}, unexpected {extra[:16]}"
                 )
             for idx, (_p, _o, rows) in shards.items():
                 expected = max(0, min(shard_size, vocab - idx * shard_size))

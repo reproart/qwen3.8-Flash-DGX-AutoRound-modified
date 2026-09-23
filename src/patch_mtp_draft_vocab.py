@@ -171,7 +171,14 @@ def _dv_gptq_rows():
     return rows, out_f, in_f, qw.numel() * 4 + sc.numel() * sc.element_size()
 
 
-if _dv_os.environ.get("VLLM_MTP_DRAFT_VOCAB") or _dv_os.environ.get("VLLM_MTP_DRAFT_HEAD"):
+_dv_head_env = _dv_os.environ.get("VLLM_MTP_DRAFT_HEAD", "").lower()
+if _dv_head_env and _dv_head_env != "int4":
+    # Only int4 has a private-head meaning; anything else (e.g. "int8") would
+    # otherwise build a full-vocabulary bf16 copy of the head (~1.2 GiB,
+    # slower than sharing the int8 one).
+    _dv_logger.warning("VLLM_MTP_DRAFT_HEAD=%r ignored (only 'int4' is supported)", _dv_head_env)
+    _dv_head_env = ""
+if _dv_os.environ.get("VLLM_MTP_DRAFT_VOCAB") or _dv_head_env == "int4":
     Qwen3_8FlashNextMTP.compute_logits = _dv_compute_logits  # type: ignore[method-assign]
     _dv_logger.info("MTP private draft head enabled: vocab=%s head=%s",
                     _dv_os.environ.get("VLLM_MTP_DRAFT_VOCAB"), _dv_os.environ.get("VLLM_MTP_DRAFT_HEAD", "shared"))

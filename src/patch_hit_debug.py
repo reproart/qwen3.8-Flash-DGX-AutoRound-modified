@@ -25,9 +25,11 @@ mis-patching.
 """
 
 import ast
+import os
 import sys
 
-SP = "/usr/local/lib/python3.12/dist-packages/vllm"
+# Site-packages dir: the Dockerfile's ARG SP (build ARGs are visible to RUN).
+SP = os.environ.get("SP", "/usr/local/lib/python3.12/dist-packages") + "/vllm"
 FILES = {
     "coord": f"{SP}/v1/core/kv_cache_coordinator.py",
     "single": f"{SP}/v1/core/single_type_kv_cache_manager.py",

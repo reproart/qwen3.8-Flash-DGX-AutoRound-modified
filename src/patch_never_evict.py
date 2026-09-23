@@ -18,9 +18,11 @@ mis-patching.
 """
 
 import ast
+import os
 import sys
 
-SP = "/usr/local/lib/python3.12/dist-packages/vllm"
+# Site-packages dir: the Dockerfile's ARG SP (build ARGs are visible to RUN).
+SP = os.environ.get("SP", "/usr/local/lib/python3.12/dist-packages") + "/vllm"
 FILES = {
     "cache": f"{SP}/config/cache.py",
     "args": f"{SP}/engine/arg_utils.py",
@@ -349,6 +351,14 @@ edit(
                 # Drop the first and last token — BPE can merge them with
                 # whatever text surrounds the marker in the real prompt.
                 self._pin_needle = ids[1:-1] if len(ids) > 2 else ids
+                if len(self._pin_needle) < 4:
+                    logger.warning(
+                        "[never-evict] the marker is only %d token(s) after "
+                        "dropping its edge tokens: it will match unrelated "
+                        "prompts and keep re-arming the pin. Use a longer, "
+                        "distinctive substring of the system prompt.",
+                        len(self._pin_needle),
+                    )
                 num_gpu_blocks = self.kv_cache_manager.block_pool.num_gpu_blocks
                 logger.info(
                     "[never-evict] armed: %d-token marker, pin capped at %d "

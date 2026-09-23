@@ -105,6 +105,17 @@ try:
 except IndexError:
     print("out-of-range: raises IndexError OK")
 
+# a missing shard must raise a clear IndexError on both gather paths
+holey = {k: v for k, v in shards.items() if k != 3}
+th = m.MmapPleTable(holey, shard_size, cols, torch.float8_e4m3fn, workers=4, chunk=512)
+for n in (1, 5000):  # fast path, pooled path
+    try:
+        th.gather(np.full(n, 3 * shard_size, dtype=np.int64))
+        raise SystemExit("expected IndexError for a missing shard")
+    except IndexError as e:
+        assert "missing" in str(e), e
+print("missing shard: raises IndexError OK")
+
 t.prewarm()
 print("prewarm: OK")
 

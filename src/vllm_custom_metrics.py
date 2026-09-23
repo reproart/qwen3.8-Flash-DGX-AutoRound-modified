@@ -1,4 +1,4 @@
-"""Engine-side Prometheus sidecar for this fork's gauges (IMPROVEMENTS-RU B3/B4).
+"""Engine-side Prometheus sidecar for this fork's gauges (README patch 11).
 
 vLLM serves /metrics from the API-server process, but the fork's interesting
 counters live in the EngineCore process: the PLE mmap gather, the mamba
@@ -18,7 +18,7 @@ Metrics (all created up front, so they are visible as 0 even before traffic):
   vllm:ple_mmap_gather_ms_total      disk-read share of the above
   vllm:ple_mmap_rows_total / vllm:ple_mmap_bytes_total
   vllm:ple_mmap_prefetch_hit_total / vllm:ple_mmap_prefetch_miss_total
-  vllm:mamba_state_copy_guard_total  gauge; tripwire, expect a constant 0
+  vllm:mamba_state_copy_guard_total  counter; tripwire, expect a constant 0
   vllm:never_evict_blocks_reserved / vllm:never_evict_pin_queue_blocks
   vllm:never_evict_pin_bytes
 
@@ -107,7 +107,7 @@ def _ensure_metrics() -> None:
         "pf_hit": c("vllm:ple_mmap_prefetch_hit", "Batch-assembly prefetch hits."),
         "pf_miss": c("vllm:ple_mmap_prefetch_miss", "Batch-assembly prefetch misses."),
         "guard": c("vllm:mamba_state_copy_guard",
-                   "Out-of-range mamba state-copy block ids skipped by the "
+                   "Out-of-range mamba state copies skipped by the "
                    "bounds guard (tripwire; expected to stay 0 — any growth "
                    "is a new bug, it is also ERROR-logged). Sampled every "
                    "512 engine steps."),

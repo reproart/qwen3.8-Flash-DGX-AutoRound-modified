@@ -24,13 +24,13 @@ mis-patching.
 """
 
 import ast
+import os
 import sys
 
-SCHED = "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py"
-MHYB = (
-    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/"
-    "model_states/mamba_hybrid.py"
-)
+# Site-packages dir: the Dockerfile's ARG SP (build ARGs are visible to RUN).
+SP = os.environ.get("SP", "/usr/local/lib/python3.12/dist-packages")
+SCHED = f"{SP}/vllm/v1/core/sched/scheduler.py"
+MHYB = f"{SP}/vllm/v1/worker/gpu/model_states/mamba_hybrid.py"
 
 
 def edit(path: str, old: str, new: str) -> None:
