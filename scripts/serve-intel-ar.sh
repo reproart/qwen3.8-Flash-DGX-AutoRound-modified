@@ -4,9 +4,9 @@
 # int8 GPTQ lm_head, blockwise-fp8 side layers, PLE n-gram table mmapped from
 # a separate directory (fp8 table recommended — see tools/fetch-ple-table-fp8.sh).
 #
-# The checkpoint must be prepared first: see docs/OPTIMIZATIONS.md ("Checkpoint
-# preparation") — tools/quantize_lm_head_int8.py, tools/fp8_convert.py,
-# tools/strip_ngram_index.py, plus the quantization_config for config.json.
+# The checkpoint must be prepared first: download the prebuilt one (README
+# Quickstart) or build it with ./prepare.sh (README "Modify the weights
+# yourself").
 #
 #   MODEL_DIR=/models/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN \
 #   TABLE_DIR=/models/ple-table-fp8 scripts/serve-intel-ar.sh
@@ -130,20 +130,36 @@ PC_ARG=--no-enable-prefix-caching
 
 # Never-evict pin: PIN_PROMPT="some exact substring of your system prompt"
 # keeps that prompt's KV blocks resident across other traffic (needs
-# PREFIX_CACHE=1). See docs/OPTIMIZATIONS.md.
+# PREFIX_CACHE=1). See the README, patch 6. Use a distinctive substring of a
+# few dozen characters: the first/last token are dropped before matching, so
+# a one- or two-word marker matches nearly every prompt and the pin churns.
 PIN_PROMPT="${PIN_PROMPT:-}"
 PIN_ARG=()
-if [ -n "$PIN_PROMPT" ] && [ "${PREFIX_CACHE:-0}" = 1 ]; then
-  PIN_ARG=(--never-evict-kv-cache-prompt-includes "$PIN_PROMPT"
-           --never-evict-kv-cache-max-fraction "${PIN_MAX_FRACTION:-0.25}")
+if [ -n "$PIN_PROMPT" ]; then
+  if [ "${PREFIX_CACHE:-0}" = 1 ]; then
+    PIN_ARG=(--never-evict-kv-cache-prompt-includes "$PIN_PROMPT"
+             --never-evict-kv-cache-max-fraction "${PIN_MAX_FRACTION:-0.25}")
+  else
+    echo "WARNING: PIN_PROMPT is set but PREFIX_CACHE != 1 — the never-evict pin needs prefix caching and is DISABLED." >&2
+  fi
+  if [ "${#PIN_PROMPT}" -lt 20 ]; then
+    echo "WARNING: PIN_PROMPT is only ${#PIN_PROMPT} chars — a short marker matches unrelated prompts; use a longer, distinctive substring." >&2
+  fi
 fi
+
+# BIND_ADDR: host address the API (and metrics) ports are published on.
+# Empty = all interfaces (Docker's default). 127.0.0.1 keeps both reachable
+# only from this machine (e.g. behind a reverse proxy) — note the metrics
+# sidecar has no auth even when API_KEY is set.
+BIND_ADDR="${BIND_ADDR:-}"
+BIND_PFX="${BIND_ADDR:+$BIND_ADDR:}"
 
 # Fail fast on unedited paths before touching the running container: Docker
 # would silently auto-create a missing bind source (the classic /path/to
-# placeholder, SETUP-RU §4/§8) and the server would die at load.
+# placeholder) and the server would die at load.
 case "$MODEL_DIR $TABLE_DIR" in
   *"/path/to"*)
-    echo "ERROR: MODEL_DIR/TABLE_DIR contain /path/to placeholders — edit serve.sh (SETUP-RU §4)." >&2
+    echo "ERROR: MODEL_DIR/TABLE_DIR contain /path/to placeholders — edit serve.sh." >&2
     exit 1 ;;
 esac
 for d in "$MODEL_DIR" "$TABLE_DIR"; do
@@ -205,7 +221,7 @@ if [ "$METRICS_PORT" != 0 ]; then
   if [ "$METRICS_OK" = 1 ] || [ "$IMAGE_OK" = 0 ]; then
     # IMAGE_OK=0 means "could not tell" — keep the user's intent, the docker
     # run below fails loudly on its own if the image is broken.
-    METRICS_PUBLISH=(-p "${METRICS_PORT}:18400")
+    METRICS_PUBLISH=(-p "${BIND_PFX}${METRICS_PORT}:18400")
     MTENV+=(-e VLLM_CUSTOM_METRICS_PORT=18400)
   else
     echo "WARNING: METRICS_PORT=$METRICS_PORT will be IGNORED: image '$IMAGE' predates the" >&2
@@ -217,7 +233,7 @@ fi
 # PLE stats go to the metrics sidecar by default (PLE_STATS_SEC=0) — but only
 # when that sidecar is actually being served. If the module is absent, the
 # probe was inconclusive, or the user turned the endpoint off (METRICS_PORT=0),
-# keep the log lines (the pre-B3/B4 behaviour) rather than losing the numbers
+# keep the log lines (the pre-sidecar behaviour) rather than losing the numbers
 # in both places. An explicit PLE_STATS_SEC always wins.
 PLE_STATS_DEFAULT=30
 { [ "$METRICS_OK" = 1 ] && [ "$METRICS_PORT" != 0 ]; } && PLE_STATS_DEFAULT=0
@@ -234,7 +250,7 @@ esac
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # shellcheck disable=SC2086
 docker run -d --name "$NAME" --restart "${RESTART:-unless-stopped}" \
-  --gpus all --ipc=host --shm-size 16g -p "${PORT}:8000" ${METRICS_PUBLISH[@]+"${METRICS_PUBLISH[@]}"} \
+  --gpus all --ipc=host --shm-size 16g -p "${BIND_PFX}${PORT}:8000" ${METRICS_PUBLISH[@]+"${METRICS_PUBLISH[@]}"} \
   --log-opt max-size="$LOG_MAX_SIZE" --log-opt max-file="$LOG_MAX_FILE" \
   --health-cmd "$HEALTH_CMD" --health-start-period=10m \
   --health-interval=60s --health-timeout=15s --health-retries=10 \
@@ -267,5 +283,5 @@ docker run -d --name "$NAME" --restart "${RESTART:-unless-stopped}" \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" --reasoning-parser qwen3 \
     ${PIN_ARG[@]+"${PIN_ARG[@]}"} ${SPEC[@]+"${SPEC[@]}"}
 
-echo ">> $NAME starting on :$PORT (ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, gpu_mem=$GPU_MEM, draft_vocab=$DRAFT_VOCAB, draft_head=$DRAFT_HEAD, metrics=$METRICS_PORT)"
+echo ">> $NAME starting on ${BIND_ADDR:-0.0.0.0}:$PORT (ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, gpu_mem=$GPU_MEM, draft_vocab=$DRAFT_VOCAB, draft_head=$DRAFT_HEAD, metrics=$METRICS_PORT)"
 echo ">> follow with: docker logs -f $NAME"

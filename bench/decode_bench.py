@@ -12,7 +12,7 @@ Env: BASE (default http://localhost:8000), MODEL (qwen), PIN (the W2 prefix
 marker — set it to your serve.sh PIN_PROMPT to measure YOUR pin), API_KEY
 (optional bearer token, matches serve.sh's API_KEY).
 """
-import json, os, re, subprocess, sys, time
+import json, os, re, statistics, subprocess, sys, time
 
 BASE = os.environ.get("BASE", "http://localhost:8000")
 MODEL = os.environ.get("MODEL", "qwen")
@@ -29,12 +29,13 @@ PIN = os.environ.get(
 
 def metrics():
     out = subprocess.run(["curl", "-s", *AUTH, f"{BASE}/metrics"], capture_output=True).stdout.decode()
+    # Counters print as e.g. 1.2e+06; accept a signed exponent too.
     m = {}
     for k in ("num_drafts", "num_draft_tokens", "num_accepted_tokens"):
-        r = re.search(rf"vllm:spec_decode_{k}_total{{[^}}]*}} ([0-9.e+]+)", out)
+        r = re.search(rf"vllm:spec_decode_{k}_total{{[^}}]*}} ([0-9.eE+-]+)", out)
         m[k] = float(r.group(1)) if r else 0.0
     m["pos"] = {int(p): float(v) for p, v in re.findall(
-        r'vllm:spec_decode_num_accepted_tokens_per_pos_total{[^}]*position="(\d+)"[^}]*} ([0-9.e+]+)', out)}
+        r'vllm:spec_decode_num_accepted_tokens_per_pos_total{[^}]*position="(\d+)"[^}]*} ([0-9.eE+-]+)', out)}
     return m
 
 
@@ -42,20 +43,31 @@ def complete(prompt, max_tokens, stream=False):
     payload = json.dumps({"model": MODEL, "prompt": prompt, "max_tokens": max_tokens,
                           "temperature": 0, "ignore_eos": True, "stream": stream})
     t0 = time.perf_counter()
+    # --fail-with-body: an HTTP error (401 without API_KEY, 404 on a wrong
+    # MODEL, ...) must stop the bench with the server's message, not turn
+    # into a silent empty stream and a crash on ttft=None further down.
+    cmd = ["curl", "-sS", "--fail-with-body", *AUTH, f"{BASE}/v1/completions",
+           "-H", "Content-Type: application/json", "-d", "@-"]
     if not stream:
-        subprocess.run(["curl", "-s", *AUTH, f"{BASE}/v1/completions", "-H",
-                        "Content-Type: application/json", "-d", "@-"],
-                       input=payload.encode(), capture_output=True)
+        r = subprocess.run(cmd, input=payload.encode(), capture_output=True)
+        if r.returncode:
+            sys.exit(f"request failed (curl rc {r.returncode}): "
+                     f"{(r.stdout + r.stderr).decode(errors='replace')[:300]}")
         return time.perf_counter() - t0, None
-    ttft = None
-    p = subprocess.Popen(["curl", "-sN", *AUTH, f"{BASE}/v1/completions", "-H",
-                        "Content-Type: application/json", "-d", "@-"],
-                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    ttft, body = None, []
+    p = subprocess.Popen(cmd[:1] + ["-N"] + cmd[1:], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     p.stdin.write(payload.encode()); p.stdin.close()
     for line in p.stdout:
         if line.startswith(b"data: ") and b"[DONE]" not in line and ttft is None:
             ttft = time.perf_counter() - t0
-    return time.perf_counter() - t0, ttft
+        elif len(body) < 20:
+            body.append(line)
+    total = time.perf_counter() - t0
+    if p.wait() or ttft is None:
+        sys.exit(f"streaming request failed (curl rc {p.returncode}): "
+                 f"{(b''.join(body) + p.stderr.read()).decode(errors='replace')[:300]}")
+    return total, ttft
 
 
 def spec_report(a, b):
@@ -80,7 +92,7 @@ for i in range(RUNS):
     tg = 999 / (total - ttft)
     w1.append(tg)
     print(f"W1 run{i}: ttft {ttft:.2f}s total {total:.2f}s tg {tg:.1f} tok/s | {spec_report(m0, metrics())}", flush=True)
-print(f"W1 median: {sorted(w1)[len(w1) // 2]:.1f} tok/s", flush=True)
+print(f"W1 median: {statistics.median(w1):.1f} tok/s", flush=True)
 
 pad = " The home has many rooms and devices." * 220  # ~8k tokens with PIN
 w2p = PIN + pad + "\nUser: what can you do?\nAssistant:"
@@ -92,5 +104,7 @@ for i in range(RUNS):
     tg = 255 / (total - ttft)
     w2.append((ttft, tg))
     print(f"W2 run{i}: ttft {ttft:.2f}s tg {tg:.1f} tok/s | {spec_report(m0, metrics())}", flush=True)
-w2.sort(key=lambda x: x[1])
-print(f"W2 median: ttft {w2[len(w2) // 2][0]:.2f}s tg {w2[len(w2) // 2][1]:.1f} tok/s", flush=True)
+# Median of each column independently (the TTFT median is not necessarily
+# from the run with the median decode speed).
+print(f"W2 median: ttft {statistics.median(t for t, _ in w2):.2f}s "
+      f"tg {statistics.median(g for _, g in w2):.1f} tok/s", flush=True)

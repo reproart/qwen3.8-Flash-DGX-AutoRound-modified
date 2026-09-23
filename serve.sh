@@ -30,6 +30,11 @@ export PREFIX_CACHE=1
 # bench/decode_bench.py will need the Authorization header while this is set.
 export API_KEY=''
 
+# Host address the API/metrics ports are published on. Empty = all
+# interfaces; 127.0.0.1 = this machine only (e.g. behind a reverse proxy).
+# The metrics sidecar (METRICS_PORT) has no auth even when API_KEY is set.
+export BIND_ADDR=''
+
 # Deterministic memory sizing for unified-memory boxes (GB10 / DGX Spark):
 # near-zero utilization fraction plus an explicit KV pool, so the driver
 # never oversubscribes the unified pool (NV_ERR_NO_MEMORY / Xid 31 crashes).
@@ -39,7 +44,8 @@ export KV_BYTES=20g
 # Context: 262144 native. For 500k via YaRN set CTX=500000 YARN=1 (the
 # upstream-validated ceiling). One 500k request costs ~15 GiB of KV
 # (~29 KB/token), so the default 20g pool fits exactly one such request —
-# raise KV_BYTES (carefully) for concurrent long contexts. See SETUP-RU.md §7.2.
+# raise KV_BYTES (carefully) for concurrent long contexts. The launcher pins
+# the MTP draft model's length to CTX so speculative decoding still boots.
 export CTX=262144
 export YARN=0
 
@@ -67,7 +73,8 @@ export HIT_DEBUG=0
 
 # Never-evict pin: any request whose prompt contains this exact substring has
 # its prompt-prefix KV blocks pinned (held out of eviction) — meant for a
-# long fixed system prompt. Empty disables it.
+# long fixed system prompt. Empty disables it. Needs PREFIX_CACHE=1; use a
+# distinctive substring (a few dozen characters), not a word or two.
 export PIN_PROMPT=''
 
 exec scripts/serve-intel-ar.sh

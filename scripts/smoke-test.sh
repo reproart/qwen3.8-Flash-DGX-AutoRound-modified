@@ -1,18 +1,33 @@
 #!/usr/bin/env bash
 # Quick check that the server is up, coherent, and measure prefill + decode.
 #   scripts/smoke-test.sh [host:port]
-# MODEL (default qwen3.8-flash-next) and API_KEY (optional bearer token,
-# matching serve.sh's API_KEY) come from the environment:
-#   MODEL=qwen scripts/smoke-test.sh localhost:8000
+# Defaults match serve.sh (localhost:8000). BASE (full URL, e.g.
+# http://spark:8000) may be given instead of the host:port argument; MODEL
+# defaults to whatever the server reports in /v1/models; API_KEY is the
+# optional bearer token, matching serve.sh's API_KEY:
+#   scripts/smoke-test.sh                       # serve.sh defaults
+#   API_KEY=... scripts/smoke-test.sh spark:18300
 set -euo pipefail
-EP="${1:-localhost:18300}"
-BASE="http://$EP"
-MODEL="${MODEL:-qwen3.8-flash-next}"
+if [ -n "${1:-}" ]; then
+  BASE="http://$1"
+else
+  BASE="${BASE:-http://localhost:8000}"
+fi
+BASE="${BASE%/}"
 API_KEY="${API_KEY:-}"
-export MODEL API_KEY   # read by the python snippets below
+AUTH=()
+[ -n "$API_KEY" ] && AUTH=(-H "Authorization: Bearer $API_KEY")
 
 echo ">> health"   # /health stays unauthenticated even with --api-key
-curl -sf -m 5 "$BASE/health" >/dev/null && echo "   OK" || { echo "   not ready"; exit 1; }
+if curl -sf -m 5 "$BASE/health" >/dev/null; then echo "   OK"; else echo "   not ready ($BASE)"; exit 1; fi
+
+if [ -z "${MODEL:-}" ]; then
+  MODEL=$(curl -sf -m 10 ${AUTH[@]+"${AUTH[@]}"} "$BASE/v1/models" \
+          | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null) \
+    || { echo "ERROR: cannot read /v1/models (wrong API_KEY?) — set MODEL explicitly" >&2; exit 1; }
+fi
+echo ">> model: $MODEL"
+export MODEL API_KEY   # read by the python snippets below
 
 echo ">> coherence"
 python3 - "$BASE" <<'PY'
