@@ -18,6 +18,13 @@ plus an int8 GPTQ lm_head and blockwise-fp8 side layers (all prepared by
 CPU-only tools in `tools/`), an **fp8** PLE table, and a set of GB10/vLLM
 patches — roughly **1.8× faster decode** than the NVFP4 recipe on the same box.
 
+> **This repository** is a modified copy of
+> [Saren-Arterius/qwen3.8-Flash-DGX-AutoRound](https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound)
+> (all of the above and every patch below). On top of it: an engine-side
+> Prometheus sidecar (PLE gather cost, mamba guard, pin gauges), API-key auth,
+> `BIND_ADDR`, a container healthcheck and log rotation, a resumable
+> `prepare.sh`, chat-API benchmarks (`bench/perf.py`, `bench/longctx.py`) and CI.
+
 > **Upstream's NVFP4 recipe independently reproduced** on a DGX Spark by
 > [@jschmied](https://github.com/jschmied) — see
 > [blazux#1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
@@ -55,6 +62,26 @@ reproduce with
 *Note: arithmetic mean ± sample standard deviation over 4 runs (2 scripts × 2 runs, 2026-09-09). Draft acceptance with thinking on is ~70% (2.1 of 3); with `enable_thinking: false` it is ~87% and decode runs 5–10% faster than the table.*
 
 
+### Measured here with `bench/perf.py` (local NVMe table)
+
+DGX Spark / GX10, this repo's `serve.sh` (MTP=3, `SEQS=8`, `KV_BYTES=30g`,
+`DRAFT_VOCAB=1`, table on local NVMe), second run after a restart (see
+*Warmup* below), code prompt with thinking off, 2026-09-23:
+
+| | |
+|---|---|
+| TTFT, short prompt | 129 ms |
+| Single-stream decode | **65.8 tok/s** (MTP 3.5 tok/step, 84% of drafts accepted) |
+| Aggregate, 8 streams × 300 tokens | **259 tok/s** (35 tok/s per stream, TTFT 0.47 s) |
+| 16 streams | requests queue above `SEQS=8` (4.7 s/req): aggregate measures admission |
+| Prefill, 2k / 8k / 33k / 105k unique tokens | 2,103 / 2,302 / 2,244 / 2,115 tok/s |
+
+Prefill prompts are unique from their first token: shared-prefix filler lets
+the prefix cache serve part of every longer prompt and inflated this same box
+to "2,860 tok/s at 120k". Run `python3 bench/perf.py` and
+`python3 bench/longctx.py` (N concurrent long prompts; flags queueing and KV
+preemption) after any change.
+
 Under concurrency, TTFT grows with MTP's prefill cost (see the next
 section), not with the paged table. On upstream's NVFP4 path
 [@jschmied](https://github.com/jschmied) measured aggregate throughput
@@ -77,8 +104,8 @@ an aggregate number.
 ## Quickstart
 
 ```bash
-git clone https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound.git
-cd qwen3.8-Flash-DGX-AutoRound
+git clone https://github.com/reproart/qwen3.8-Flash-DGX-AutoRound-modified.git
+cd qwen3.8-Flash-DGX-AutoRound-modified
 
 docker build -t qwen38-flash-dgx .   # official image + this fork's patches
 
@@ -92,6 +119,7 @@ hf download Saren/Qwen3.8-Flash-Next-ple-table-fp8 --local-dir /models/ple-table
 # Point serve.sh at your checkpoint + table dirs, then:
 ./serve.sh                           # boots on :8000 (~5 min with fastsafetensors)
 docker logs -f qwen38-flash          # wait for "Application startup complete"
+python3 bench/perf.py --only warmup  # optional: compile first-use kernels now (see Warmup)
 ```
 
 Then hit the OpenAI-compatible API:
@@ -130,6 +158,13 @@ reads the same packed tensors — the GPTQModel-style `dynamic` rules exclude
 the families that are not int4-packed and flip the head to 8-bit. The original
 AutoRound config is kept as `config.json.autoround`.
 
+The script is resumable: if a step fails (network, disk), fix the cause and
+run the same command again — finished steps are skipped, and no tool ever
+re-quantizes its own output or overwrites a backup (`tools/test_tools_cpu.py`
+checks exactly that). The download also skips shards that hold only the
+n-gram table (dropped from the index anyway) when the `huggingface_hub`
+Python package is importable.
+
 ## Serving
 
 ```bash
@@ -144,31 +179,68 @@ or edit the paths in `serve.sh` (the example config used above) and run it.
 
 | Var | `serve.sh` default | Notes |
 |---|---|---|
-| `MODEL_DIR` / `TABLE_DIR` | `/path/to/...` — edit these | Prepared checkpoint / fp8 PLE table dirs |
+| `MODEL_DIR` / `TABLE_DIR` | `/models/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid-MTP_int4RTN` / `/models/ple-table-fp8` — edit to your paths | Prepared checkpoint / fp8 PLE table dirs (must exist; checked before the running container is touched) |
 | `PORT` | `8000` | API port (bare script: `18300`) |
 | `CTX` | `262144` | Max context |
 | `YARN` | `0` | `1` = Qwen's YaRN rope scaling (factor 4) past the native 262144 — set `CTX` too (500k was upstream's validated ceiling). Also forces the MTP draft's `max_model_len`, which `--hf-overrides` alone doesn't reach |
 | `SEQS` | `8` | Max concurrent sequences (don't benchmark with 1–2, see below) |
 | `GPU_MEM` | `0.01` | Near-zero pool fraction, paired with `KV_BYTES`: deterministic sizing, so the driver never oversubscribes the unified pool (`NV_ERR_NO_MEMORY` / Xid 31 freezes). Bare script: a `0.85` fraction — avoid on unified-memory boxes. |
-| `KV_BYTES` | `20g` | Explicit KV pool size, passed as `--kv-cache-memory-bytes` (bare script: unset) |
+| `KV_BYTES` | `30g` | Explicit KV pool size, passed as `--kv-cache-memory-bytes` (bare script: unset). vLLM reads `g` as 10⁹ bytes: `30g` = 27.9 GiB ≈ 966k tokens at ~31 KB/token (the boot log prints "GPU KV cache size"). Every GiB here is a GiB less page cache for the ~48 GiB PLE table |
 | `MTP` | `3` | Speculative tokens from the MTP head (`0` = off; bare script: `2`) |
 | `PREFIX_CACHE` | `1` | Prefix caching — fixed and recommended on this fork (bare script: `0`) |
 | `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (patch 9; @jschmied, vllm#55122): identical output at T=0 at full prefill speed. `0` = stock kernel (non-deterministic, may drop attention candidates) |
 | `EXACT_TOPK` | `0` | `1` = exact `torch.topk` fallback (patch 9; deterministic, −20–40% on long prefill). Wins over `DET_TOPK` when set |
 | `DRAFT_VOCAB` | `1` | The MTP drafter scores only the 65,536 most frequent tokens (patch 10; from upstream blazux): +3–5% decode on English/code, draft acceptance unchanged there (thinking on or off). The shipped id set is English/code-weighted — **CJK-heavy output loses acceptance and decode speed with it**, so set `0` (full vocabulary) or build your own set with `tools/build_draft_vocab.py` over your traffic |
 | `DRAFT_HEAD` | `int8` | `int4` gives the drafter a private int4 g128 RTN GPTQ-Marlin copy of the full-vocabulary head (built at first use, ~313 MiB vs 616 MiB read per draft step). Measured a wash: tg unchanged within noise, draft acceptance 1–8 points lower (see the MTP options section), so the shared int8 head stays the default |
-| `PIN_PROMPT` / `PIN_MAX_FRACTION` | unset / `0.25` | Never-evict pin (patch 6); needs `PREFIX_CACHE=1` |
+| `PIN_PROMPT` / `PIN_MAX_FRACTION` | unset / `0.25` | Never-evict pin (patch 6); needs `PREFIX_CACHE=1` (the launcher warns otherwise). Use a distinctive substring of a few dozen characters — a word or two matches unrelated prompts |
+| `API_KEY` | unset | Non-empty → Bearer auth on the API (vLLM `--api-key`; generate with `openssl rand -hex 32`). `/health` stays open; the key is visible in `docker inspect` |
+| `BIND_ADDR` | unset | Host address for the published ports. Unset = all interfaces; `127.0.0.1` = this machine only (e.g. behind a reverse proxy). The metrics sidecar has no auth even with `API_KEY` |
 | `FP8_HYBRID` | `1` | int4+fp8 hybrid dispatch (patch 4) |
 | `PLE_MADV_RANDOM` | `1` | `MADV_RANDOM` on the table mmap (patch 1): no readahead around 160-byte row faults — upstream (blazux `0c6df7e`) measured 4–8% faster cold prefill and a cleaner page cache, now the default |
+| `METRICS_PORT` | `18400` | Engine-side Prometheus sidecar (`src/vllm_custom_metrics.py`): `vllm:ple_mmap_*` counters (ops, op/gather ms, rows, bytes, prefetch hit/miss), `vllm:mamba_state_copy_guard_total` (tripwire, expect 0) and `vllm:never_evict_{blocks_reserved,pin_queue_blocks,pin_bytes}` gauges. vLLM's own `/metrics` runs in the API-server process and cannot see EngineCore counters, so these are served from the engine process on this separate port; `0` = off. The launcher probes the image for both the module and its start hooks, and warns when the sidecar cannot come up (the port would just stay closed) |
 | `PLE_PREFETCH` | `0` | Batch-assembly prefetch — measured not worth enabling (see appendix) |
+| `PLE_CHUNK` / `PLE_FAST_ROWS` / `PLE_STATS_SEC` | `2048` / `512` / `0`* | Gather rows per task / decode fast-path threshold / stats-log period. The log lines are off by default since the numbers moved to the metrics sidecar (`METRICS_PORT`); set `30` to bring them back. *On an image without the sidecar the launcher keeps them at `30` |
 | `HIT_DEBUG` | `0` | Prefix-cache tracing (patch 8) |
+| `HIT_DEBUG_N` | `0` | Event budget for `HIT_DEBUG=1`; tracing auto-disables with a warning once spent |
+| `STEP_PROFILE` | `0` | `1` — on-demand torch profiler, triggered by `touch /tmp/profile_trigger` inside the container (patch 11) |
 | `PREWARM` | `1` | Stream the table once at boot to warm the page cache |
 | `WORKERS` | `32` | Threads for the mmap gather |
 | `LOAD_FORMAT` | `fastsafetensors` | Noticeably faster cold boots |
 | `TOOL_PARSER` | `qwen3_xml` | Tool-call parser (bare script: `qwen3_coder`) |
 | `SERVED_NAME` | `qwen` | Model id on the API (bare script: `qwen3.8-flash-next`) |
 | `ITER_DETAILS` | `0` | `1` = per-step prefill metrics: `vllm:scheduled_ctx_tokens_total` updates every engine step (stock `prompt_tokens_total` only moves when a prefill finishes). Live view: `bench/ppwatch.sh` |
+| `FLASHINFER_AUTOTUNE` | `0` | `1` — enable flashinfer kernel autotuning (longer warmup, possibly faster kernels) |
+| `CUDA_LAUNCH_BLOCKING` | `0` | `1` — synchronous CUDA errors, for debugging Xid 31 (much slower; not for production) |
+| `RESTART` | `unless-stopped` | Container restart policy — survives reboots and crashes; `no` = manual start only. The next `./serve.sh` re-creates the container with this value |
+| `LOG_MAX_SIZE` / `LOG_MAX_FILE` | `10m` / `3` | Docker log rotation — `PLE mmap stats` logs a line every 30 s, so an unbounded log grows to GBs |
+| `NAME` / `IMAGE` | `qwen38-flash` / `qwen38-flash-dgx` | Container / image names (`IMAGE` is not overwritten by serve.sh — point it at a backup tag to roll back) |
 | `EXTRA` | | Extra vLLM flags, passed verbatim |
+
+The launcher probes the image before touching the running container and warns
+when a knob needs a patch the image lacks (`DET_TOPK`, `EXACT_TOPK`,
+`ITER_DETAILS`, `DRAFT_VOCAB`/`DRAFT_HEAD`, `METRICS_PORT`) — rebuild with
+`docker build -t qwen38-flash-dgx .` rather than trusting a silently ignored
+env var.
+
+The launcher also fail-fasts on unedited `/path/to` placeholders or missing
+`MODEL_DIR`/`TABLE_DIR` *before* it removes a running container, and creates
+the container with a `/health` HEALTHCHECK (a 10-minute start period covers
+the weight load; 10 consecutive misses → `unhealthy` in `docker ps` — a
+restart on unhealthy needs an external watcher such as `willfarrell/autoheal`)
+and json-file log rotation. The bench and smoke-test scripts read `BASE` /
+`MODEL` / `PIN` / `API_KEY` from the environment (where applicable), so they
+work unchanged with a non-default port or with auth on. Their defaults match
+`serve.sh` (`http://localhost:8000`, model `qwen`); `scripts/smoke-test.sh`
+also takes `host:port` as its argument and, without `MODEL`, uses whatever
+`/v1/models` reports.
+
+For graphs, scrape **two** endpoints: vLLM's own `/metrics` on `PORT` (request
+throughput, cache usage, queue time) and the engine-side sidecar on
+`METRICS_PORT` (default 18400) — PLE gather cost
+(`rate(vllm:ple_mmap_op_ms_total)/rate(vllm:ple_mmap_ops_total)` = ms/op), the
+mamba state-copy guard tripwire and the never-evict pin footprint. With the
+sidecar on, the `PLE mmap stats` log lines default off (`PLE_STATS_SEC=0`).
+
 
 ## Limitations & notes
 
@@ -196,7 +268,15 @@ or edit the paths in `serve.sh` (the example config used above) and run it.
 ## The patches
 
 Everything is applied at image build time (see the `Dockerfile`); each patch is
-independent and gated by an env var where it changes behavior.
+independent and gated by an env var where it changes behavior. The build is
+fail-fast — patch scripts assert their anchors — and a successful build prints
+one confirmation per step: `ple_layer.py patched OK`, `fla shmem gate patched`,
+`fla num_warps pinned`, `auto_gptq.py patched OK`, `never-evict pin patched OK`,
+`lm_head patched OK in model.py + mtp.py`, `mamba_utils.py guarded OK`,
+`patch_hit_debug.py applied OK`, `patch_mamba_align_split.py applied OK`,
+`qsa.py: top-k variants (1|fill) added OK`, `qsadet INSTALLED`, `qsadet wired OK`,
+`patch_step_profile.py applied OK`, `loggers.py: per-step prefill metrics added
+OK` and `draft-head hook INSTALLED`. A missing line means that step did not run.
 
 ### 1. PLE mmap upgrades (`src/vllm_ple_mmap.py`, extends upstream's patch)
 
@@ -217,9 +297,11 @@ independent and gated by an env var where it changes behavior.
 - **`VLLM_PLE_MMAP_MADV_RANDOM=1`**: `madvise(MADV_RANDOM)` the mmap so faults
   stay single-page — for tables on remote RAM or boxes with no page-cache
   headroom.
-- **Stats**: `VLLM_PLE_MMAP_STATS_SEC` (default 30) logs
-  `PLE mmap stats (last Ns): calls, op ms, gather ms, rows, MB` and resets the
-  counters each period.
+- **Stats**: lifetime counters go to the metrics sidecar (patch 13); with
+  `VLLM_PLE_MMAP_STATS_SEC=30` the engine also logs
+  `PLE mmap stats (last Ns): calls, op ms, gather ms, rows, MB` per period.
+- **Fail-fast table check**: every shard `0..parts-1` must be present at load
+  time — a missing one used to surface mid-serving as a `TypeError`.
 
 ### 2. FLA shared-memory gate (`Dockerfile` sed)
 
@@ -337,7 +419,7 @@ boundary-state publication (which slots were real/null/hashed), cached-block
 evictions, and prefill chunk-stop decisions. This is what found the bug in
 patch 5; costs nothing when off.
 
-### 9. Deterministic QSA top-k (`src/patch_qsa_exact_topk.py` + Dockerfile patch 10)
+### 9. Deterministic QSA top-k (`src/patch_qsa_exact_topk.py` + a kernel built in the `Dockerfile`)
 
 Taken from upstream [blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX)
 (`8347e7c`, `4b723de`, `0022e36`). The sparse attention (QSA) picks its top-k key
@@ -419,17 +501,74 @@ Throughput table).
   the same ~4% ceiling for head-shrinking tricks once the head kernel is
   bandwidth-bound, which Marlin already is here.
 
+### 11. On-demand step profiling (`src/patch_step_profile.py`, `STEP_PROFILE=1`)
+
+This vLLM build predates `VLLM_TORCH_PROFILER_DIR` and `/start_profile`. With
+`STEP_PROFILE=1`, `docker exec qwen38-flash touch /tmp/profile_trigger` makes
+the next 24 engine steps run under torch.profiler (CPU+CUDA) and writes a
+chrome trace to `/tmp/step_profile_<n>.json` — `docker cp` it out and open at
+ui.perfetto.dev. Old traces are pruned to the 3 newest; when idle the patch
+costs one `os.path.exists` per step.
+
+### 12. Per-step prefill metrics (`src/patch_prefill_metrics.py`, `ITER_DETAILS=1`)
+
+vLLM credits `vllm:prompt_tokens_total` only when a request's prefill
+*finishes*, so a 100k-token prompt shows 0 tok/s for a minute and then a spike.
+With `ITER_DETAILS=1` (→ `--enable-logging-iteration-details`) this patch feeds
+`vllm:scheduled_ctx_tokens_total` and `vllm:scheduled_iterations_total` on
+vLLM's own `/metrics` every engine step and mutes the stock one-line-per-step
+log. `bench/ppwatch.sh` prints live prefill tok/s from them. From
+Saren-Arterius/qwen3.8-Flash-DGX-AutoRound. Self-check: `docker run --rm -v
+"$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx test_prefill_metrics_cpu.py`.
+
+### 13. Engine-side metrics sidecar (`src/vllm_custom_metrics.py`, `METRICS_PORT`)
+
+vLLM's own `/metrics` is served by the API-server process, which cannot see the
+EngineCore-side counters this fork cares about; plumbing them through the
+serialized `SchedulerStats` IPC would mean patching vLLM internals blindly. So
+the engine process serves them itself with `prometheus_client` (the library
+vLLM already uses) on its own port: `vllm:ple_mmap_*` (ops, op/gather ms, rows,
+bytes, prefetch hit/miss — `rate(op_ms)/rate(ops)` is ms/op), the
+`vllm:mamba_state_copy_guard_total` tripwire and the `vllm:never_evict_*` pin
+gauges. It starts lazily from the first data push (i.e. in the process that
+actually has data) and every failure is swallowed — telemetry never takes the
+server down. With it on, the `PLE mmap stats` log lines default off
+(`PLE_STATS_SEC=0`); on an image without the module the launcher keeps them at
+`30` instead of going silent.
+
 ## Speculative decoding and TTFT
 
-MTP raises decode substantially but puts a floor (~0.8 s) under
-time-to-first-token: vLLM's v1 engine only emits the first token after the
-drafter has run, and MTP's draft layer is a stateful autoregressive
-transformer — on every prefill chunk it must run a full-chunk-width forward
-(always eager: above the cudagraph capture sizes) to sync its own KV/GDN
-state, plus k−1 sequential single-token passes. Cross-attention drafters like
-DFlash don't pay this, but Flash-Next has no such drafter — MTP is what ships
-in the checkpoint. If your workload is TTFT-sensitive, weigh `MTP` depth
-against `MTP=0`; only 0 removes the floor.
+MTP's draft layer is a stateful autoregressive transformer: vLLM's v1 engine
+only emits the first token after the drafter has run, and on every prefill
+chunk the drafter runs a full-chunk-width forward (always eager: above the
+cudagraph capture sizes) to sync its own KV/GDN state, plus k−1 sequential
+single-token passes. Earlier versions of this README called that a ~0.8 s TTFT
+floor. On this stack, warmed up (`bench/perf.py`, MTP=3), it is not a floor
+but part of the prefill rate:
+
+| prompt | 1 line | 2,194 | 8,481 | 33,612 | 105,290 tokens |
+|---|---|---|---|---|---|
+| TTFT | 0.13 s | 1.04 s | 3.68 s | 14.98 s | 49.77 s |
+
+— i.e. TTFT ≈ 0.1 s + prompt / ~2,200–2,400 tok/s. A cold server does show
+second-long stalls, from first-use kernel compiles (next section), not from
+MTP. Cross-attention drafters like DFlash skip the per-chunk drafter forward,
+but Flash-Next has no such drafter; `MTP=0` removes that cost from prefill at
+the price of decode speed.
+
+### Warmup
+
+After every restart, Triton compiles several kernels on first use *during
+inference* — vLLM's `jit_monitor` logs each one as `Triton kernel JIT
+compilation during inference`: the spec-decode sampling kernels
+(`_rejection_kernel`, `_resample_kernel`, ...) on the first request, the QSA
+split-k/merge kernels at the first few concurrent streams, and the QSA indexer
+(`_qsa_pre_indexer_kernel`, `_expand_qsa_indices_kernel`) on the first ~2k-token
+prompt. Each is a stall of about a second for whoever hits it first — on a
+fresh container the first 4-stream wave saw TTFT 1.94 s instead of 0.39 s.
+`python3 bench/perf.py --only warmup` touches all of those shapes in ~20 s;
+`bench/perf.py` runs it before measuring (`--no-warmup` to measure a cold
+server).
 
 ## What's in here
 
@@ -438,12 +577,13 @@ Dockerfile                    official vLLM Flash-Next image + the patches above
 serve.sh                      example launcher config (edit paths, run)
 prepare.sh                    build the checkpoint + table from Intel's release
 src/vllm_ple_mmap.py          mmap PLE table (any dtype, relocatable dir, fast gather)
+src/vllm_custom_metrics.py    engine-side Prometheus sidecar: PLE/guard/pin (METRICS_PORT)
 src/vllm_fp8_hybrid.py        int4+fp8 hybrid dispatch on the GPTQ config
 src/patch_never_evict.py      never-evict system-prompt KV pinning
 src/patch_mamba_align_split.py  prefix-cache chunk-alignment fix
 src/patch_hit_debug.py        prefix-cache tracing (VLLM_HIT_DEBUG)
 src/patch_qsa_exact_topk.py   exact, deterministic QSA top-k (VLLM_QSA_EXACT_TOPK=1; from blazux)
-(Dockerfile patch 10)         @jschmied's deterministic persistent_topk kernel, built at docker build
+(Dockerfile, _C_det.so)       @jschmied's deterministic persistent_topk kernel, built at docker build
 src/test_qsa_exact_topk_cpu.py  CPU unit test for the exact top-k (no GPU needed)
 src/patch_mtp_draft_vocab.py  private MTP draft head: reduced vocabulary (from blazux) / int4 (VLLM_MTP_DRAFT_VOCAB, VLLM_MTP_DRAFT_HEAD)
 src/draft_vocab_65536.npy     the default 65,536-token draft id set (from blazux)
@@ -452,19 +592,32 @@ tools/quantize_mtp_experts_int4.py  int4 RTN the MTP draft experts -> -MTP_int4R
 src/mamba_utils_guarded.py    hardened align-mode state copy (vllm#50729 + guard)
 src/test_ple_mmap_cpu.py      CPU unit test for the gather (no GPU needed)
 src/test_never_evict_pin.py   CPU unit test for the pin (no GPU needed)
+src/test_custom_metrics_cpu.py  CPU unit test for the metrics sidecar (no GPU, no vLLM)
+src/test_prefill_metrics_cpu.py  check for the prefill-metrics patch (inside the image)
+src/patch_step_profile.py     on-demand torch.profiler around engine steps (VLLM_STEP_PROFILE)
 scripts/serve-intel-ar.sh     the docker run behind serve.sh
 scripts/smoke-test.sh         health + coherence + prefill/decode numbers
 src/patch_prefill_metrics.py  per-step prefill counters for Prometheus (ITER_DETAILS=1)
 bench/ppwatch.sh              live prefill tok/s from those counters
 bench/decode_bench.py         batch-1 decode / TTFT / spec-acceptance bench
+bench/concurrency_bench.py    N-stream throughput / TTFT / queue-time bench (completions API)
+bench/perf.py                 one-command overview over the chat API: warmup, TTFT, decode, concurrency, prefill
+bench/longctx.py              concurrent long-context test (queue / preemption / cache checks)
+bench/common.py               shared chat-API client for perf.py / longctx.py
+tools/eval_quality.py         ppl + greedy-facts quality check against the API
+tools/test_tools_cpu.py       CPU test for the preparation tools (correctness, safe re-runs)
 tools/                        CPU-only checkpoint preparation
-docs/HOW-IT-WORKS.md          upstream's mmap-PLE story
-docs/OPTIMIZATIONS.md         this fork's patches in depth
+docs/HOW-IT-WORKS.md          upstream's mmap-PLE story (NVFP4-era numbers)
+docs/OPTIMIZATIONS.md         stub (kept for old links; the recipe lives in this README)
+.github/workflows/ci.yml      CI: ruff, shellcheck, the CPU tests
 ```
 
 ## Credits
 
 - Model: **Qwen team, Alibaba** — Qwen3.8-Flash-Next.
+- This repository is based on
+  **[Saren-Arterius/qwen3.8-Flash-DGX-AutoRound](https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound)**,
+  the int4/int8/fp8 AutoRound fork this README describes.
 - **This is a fork of [blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX)** —
   the original mmap-PLE idea, the GB10 serving recipe, the NVFP4 path, and
   docs/HOW-IT-WORKS.md are theirs.
@@ -524,7 +677,7 @@ Takeaways:
   **net-negative on local NVMe**: the handoff/wait in `consume()` costs more
   than the inline gather it replaces (confirmed on a warm page cache). It
   stays experimental and default-off.
-- TTFT is unaffected by any of this (the MTP drafter floor dominates), and
+- TTFT is unaffected by any of this (prefill compute dominates), and
   between-restart variance on this bench is >10% — treat small deltas above
   accordingly.
 
@@ -535,11 +688,3 @@ project. If you have a NAS with **≥64 GB of RAM** and a **≥100 Gbit RDMA
 link** to your Spark — and no second DGX Spark to put to better use — the
 [`magi` branch](../../tree/magi) ships the tool (`src/ple_rdma/`) and setup
 notes ("PLE table over RDMA"). Everyone else: local NVMe is the recipe.
-
----
-
-### RUN THE TEST
-
-`python3 bench/perf.py`
-
-`python3 bench/longctx.py`
