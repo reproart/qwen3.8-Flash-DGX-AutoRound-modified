@@ -39,7 +39,7 @@ export BIND_ADDR=''
 # near-zero utilization fraction plus an explicit KV pool, so the driver
 # never oversubscribes the unified pool (NV_ERR_NO_MEMORY / Xid 31 crashes).
 export GPU_MEM=0.01
-export KV_BYTES=20g
+export KV_BYTES=30g
 
 # Context: 262144 native. For 500k via YaRN set CTX=500000 YARN=1 (the
 # upstream-validated ceiling). One 500k request costs ~15 GiB of KV

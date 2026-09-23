@@ -535,3 +535,11 @@ project. If you have a NAS with **≥64 GB of RAM** and a **≥100 Gbit RDMA
 link** to your Spark — and no second DGX Spark to put to better use — the
 [`magi` branch](../../tree/magi) ships the tool (`src/ple_rdma/`) and setup
 notes ("PLE table over RDMA"). Everyone else: local NVMe is the recipe.
+
+---
+
+### RUN THE TEST
+
+`python3 bench/perf.py`
+
+`python3 bench/longctx.py`
