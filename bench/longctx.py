@@ -39,9 +39,22 @@ import common
 from common import chat, delta, metrics, unique_prompt
 
 
+def _poll(stop, peak):
+    """Sample KV-pool usage and running requests every 2 s until stop is set."""
+    while not stop.wait(2.0):
+        m = metrics()
+        u = m.get("kv_usage", m.get("kv_usage_old"))
+        if u is not None:
+            peak["kv"] = max(peak.get("kv", 0.0), u)
+        if m.get("running") is not None:
+            peak["running"] = max(peak.get("running", 0), int(m["running"]))
+
+
 def run_level(n, ctx, gen):
     forced = gen is not None
     out, errors = [None] * n, []
+    peak, stop = {}, threading.Event()
+    poller = threading.Thread(target=_poll, args=(stop, peak), daemon=True)
     tag = uuid.uuid4().hex[:8]  # fresh per row: no cross-row reuse either
 
     def worker(i):
@@ -53,13 +66,16 @@ def run_level(n, ctx, gen):
 
     m0 = metrics()
     t0 = time.perf_counter()
+    poller.start()
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     wall = time.perf_counter() - t0
-    return [r for r in out if r], errors, wall, m0, metrics()
+    stop.set()
+    poller.join()
+    return [r for r in out if r], errors, wall, m0, metrics(), peak
 
 
 def main():
@@ -82,7 +98,7 @@ def main():
     print("-" * 99)
 
     for n in args.streams:
-        done, errors, wall, m0, m1 = run_level(n, args.ctx, args.gen)
+        done, errors, wall, m0, m1, peak = run_level(n, args.ctx, args.gen)
         if errors:
             print(f"{n:>7}  {len(errors)} request(s) failed, e.g. {errors[0][:120]}"
                   " — check `docker logs` (OOM / restart?)")
@@ -103,6 +119,16 @@ def main():
               f"{f(statistics.median(ttfts) if ttfts else None, '>8.1f')}s "
               f"{f(max(ttfts) if ttfts else None, '>8.1f')}s {wall / n:>8.1f}s "
               f"{f(queue, '>6.1f')}s {f(pre, '>8.0f')}")
+        if "kv" in peak:
+            # Only meaningful when every stream was resident at the same time
+            # (--gen): then usage = their tokens / what the pool really holds.
+            tokens = total + sum(r["completion_tokens"] for r in done)
+            line = (f"        peak KV pool usage {100 * peak['kv']:.1f}%, "
+                    f"up to {peak.get('running', '?')} requests running")
+            if peak.get("running") == n and peak["kv"] > 0.05:
+                line += (f" -> ~{tokens / 1e3:.0f}k tokens resident, so the pool holds "
+                         f"~{tokens / peak['kv'] / 1e6:.2f}M such tokens")
+            print(line)
         if hits:
             print(f"        !! {hits:.0f} prefix-cache hit tokens on unique prompts — "
                   "the numbers above are optimistic")

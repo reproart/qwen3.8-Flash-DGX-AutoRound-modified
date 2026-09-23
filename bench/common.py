@@ -153,6 +153,11 @@ _METRICS = {
     "draft_tokens": "vllm:spec_decode_num_draft_tokens_total",
     "accepted": "vllm:spec_decode_num_accepted_tokens_total",
     "preempted": "vllm:num_preemptions_total",
+    # gauges (current value, not counters)
+    "kv_usage": "vllm:kv_cache_usage_perc",
+    "kv_usage_old": "vllm:gpu_cache_usage_perc",  # name in older vLLM builds
+    "running": "vllm:num_requests_running",
+    "waiting": "vllm:num_requests_waiting",
 }
 
 
