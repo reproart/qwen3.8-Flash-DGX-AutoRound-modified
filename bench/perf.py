@@ -20,6 +20,15 @@ What the columns mean (and the traps they avoid):
     words, so the prefix cache cannot serve part of them and the PLE table
     sees realistic row diversity; the prefix-cache hit counter is checked and
     the rate is computed over uncached tokens only.
+  * warmup: after a restart, Triton compiles several kernels on their first
+    use DURING inference (spec-decode rejection sampling, the QSA split-k /
+    merge kernels at a few concurrent streams, the QSA indexer on the first
+    ~2k-token prompt) — seconds of stall that land in whatever runs first.
+    The warmup pass touches those shapes before anything is measured;
+    `--only warmup` does just that (useful right after ./serve.sh), and
+    `--no-warmup` measures the cold server on purpose.
+  * PLE ms/op per section comes from the engine-side metrics sidecar
+    (METRICS_PORT), as a delta around that section only.
 """
 import argparse
 import statistics
@@ -29,7 +38,8 @@ import time
 import uuid
 
 import common
-from common import CODE_PROMPT, chat, decode_rate, delta, metrics, spec_summary, unique_prompt
+from common import (CODE_PROMPT, chat, decode_rate, delta, metrics, ple_summary, sidecar,
+                    spec_summary, unique_prompt)
 
 
 def _med(xs):
@@ -39,6 +49,37 @@ def _med(xs):
 
 def _fmt(x, spec, unit=""):
     return "n/a" if x is None else f"{x:{spec}}{unit}"
+
+
+def _parallel(n, fn):
+    """Run fn(i) for i in range(n) concurrently -> (results, errors, wall)."""
+    out, errors = [None] * n, []
+
+    def worker(i):
+        try:
+            out[i] = fn(i)
+        except Exception as e:  # noqa: BLE001 - reported by the caller
+            errors.append(repr(e))
+
+    t0 = time.perf_counter()
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return [r for r in out if r], errors, time.perf_counter() - t0
+
+
+def warmup(levels):
+    """Trigger the first-use Triton JIT compiles before anything is timed."""
+    print("## 0. Warmup (first-use kernel compiles)", flush=True)
+    t0 = time.perf_counter()
+    chat("hi", 8)
+    chat(CODE_PROMPT, 64, stream=True)                     # spec-decode sampling kernels
+    for n in sorted({x for x in levels if x <= 16} | {2, 4, 8}):
+        _parallel(n, lambda i: chat(f"[{uuid.uuid4().hex[:8]}] {CODE_PROMPT}", 32, stream=True))
+    chat(unique_prompt(uuid.uuid4().hex, 3000), 8, stream=True)  # QSA indexer path
+    print(f"   done in {time.perf_counter() - t0:.1f}s\n")
 
 
 def ttft_probe(n=5):
@@ -55,6 +96,7 @@ def ttft_probe(n=5):
 def single_stream(n=5, max_tokens=700):
     print(f"## 2. Single-stream decode (code, thinking off, up to {max_tokens} tokens)")
     rows = []
+    s0 = sidecar()
     for _ in range(n):
         m0 = metrics()
         r = chat(CODE_PROMPT, max_tokens, stream=True)
@@ -67,38 +109,26 @@ def single_stream(n=5, max_tokens=700):
     if short:
         print(f"   note: {len(short)} run(s) stopped early (<50% of max_tokens) — "
               "short runs overweight the fixed per-request cost")
+    ple = ple_summary(s0, sidecar())
     print(f"   MEDIAN decode {_fmt(_med(decode_rate(r) for r, _ in rows), '.1f')} tok/s   "
-          f"e2e {statistics.median(r['completion_tokens'] / r['e2e'] for r, _ in rows):.1f} tok/s\n")
+          f"e2e {statistics.median(r['completion_tokens'] / r['e2e'] for r, _ in rows):.1f} tok/s"
+          f"{'   ' + ple if ple else ''}\n")
 
 
 def concurrency(levels, tokens=300):
     print(f"## 3. Concurrency sweep ({tokens} tokens per stream)")
     print(f"   {'streams':>7} {'wall(s)':>8} {'aggregate':>11} {'decode/stream':>14} "
-          f"{'TTFT p50':>9} {'TTFT max':>9} {'queue':>9}")
-    print("   " + "-" * 74)
+          f"{'TTFT p50':>9} {'TTFT max':>9} {'queue':>9} {'PLE ms/op':>10}")
+    print("   " + "-" * 85)
     peak = (0, 0.0)
     for n in levels:
-        out, errors = [None] * n, []
-
-        def worker(i):
-            try:
-                # uuid first: unique from the first token, no prefix reuse
-                out[i] = chat(f"[{uuid.uuid4().hex[:8]}] {CODE_PROMPT} Variant {i}.",
-                              tokens, stream=True)
-            except Exception as e:  # noqa: BLE001 - reported below
-                errors.append(repr(e))
-
-        m0 = metrics()
-        t0 = time.perf_counter()
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        wall = time.perf_counter() - t0
-        m1 = metrics()
-
-        done = [r for r in out if r]
+        m0, s0 = metrics(), sidecar()
+        # uuid first: unique from the first token, no prefix reuse
+        done, errors, wall = _parallel(n, lambda i: chat(
+            f"[{uuid.uuid4().hex[:8]}] {CODE_PROMPT} Variant {i}.", tokens, stream=True))
+        m1, s1 = metrics(), sidecar()
+        ops = delta(s0, s1, "ple_ops")
+        ple = delta(s0, s1, "ple_op_ms") / ops if ops else None
         if errors:
             print(f"   {n:>7}  {len(errors)} request(s) failed, e.g. {errors[0][:120]}")
             if not done:
@@ -112,7 +142,7 @@ def concurrency(levels, tokens=300):
             peak = (n, agg)
         print(f"   {n:>7} {wall:>8.1f} {agg:>7.1f} t/s {_fmt(_med(decode_rate(r) for r in done), '>9.1f')} t/s "
               f"{_fmt(_med(ttfts), '>8.2f', 's')} {_fmt(max(ttfts) if ttfts else None, '>8.2f', 's')} "
-              f"{_fmt(queue, '>8.2f', 's')}{flag}")
+              f"{_fmt(queue, '>8.2f', 's')} {_fmt(ple, '>10.1f')}{flag}")
         time.sleep(3)
     if peak[0]:
         print(f"\n   peak aggregate without queueing: {peak[1]:.1f} tok/s at {peak[0]} streams\n")
@@ -123,14 +153,16 @@ def concurrency(levels, tokens=300):
 def prefill(targets):
     print("## 4. Long-context prefill (unique prompts, prefix cache checked)")
     for target in targets:
-        m0 = metrics()
+        m0, s0 = metrics(), sidecar()
         r = chat(unique_prompt(uuid.uuid4().hex, target), 8, stream=True)
         hits = delta(m0, metrics(), "pc_hits")
+        ple = ple_summary(s0, sidecar())
         fresh = r["prompt_tokens"] - (hits or 0)
         rate = fresh / r["ttft"] if r["ttft"] else None
         cached = "n/a" if hits is None else f"{hits:.0f}"
         print(f"   prompt {r['prompt_tokens']:>7} tok (cached {cached:>5}) -> "
-              f"TTFT {_fmt(r['ttft'], '>6.2f', 's')}   prefill ~{_fmt(rate, '>6.0f')} tok/s")
+              f"TTFT {_fmt(r['ttft'], '>6.2f', 's')}   prefill ~{_fmt(rate, '>6.0f')} tok/s"
+              f"{'   ' + ple if ple else ''}")
         if hits:
             print("   !! prefix-cache hit on a unique prompt — the rate above excludes it")
     print()
@@ -142,19 +174,25 @@ def main():
                     help="concurrency levels (default: 1 2 4 8 16)")
     ap.add_argument("--prefill", nargs="+", type=int, default=[2000, 8000, 32000, 100000],
                     help="approx. prompt sizes for the prefill section")
-    ap.add_argument("--only", choices=["ttft", "decode", "concurrency", "prefill"],
-                    help="run a single section")
+    ap.add_argument("--only", choices=["warmup", "ttft", "decode", "concurrency", "prefill"],
+                    help="run a single section (warmup alone: prime a freshly started server)")
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="skip the warmup pass (measure first-use JIT stalls on purpose)")
     args = ap.parse_args()
 
     print(f"endpoint {common.BASE}  model {common.MODEL}")
     if not metrics():
         print("note: /metrics unreachable — queue / MTP / prefix-cache columns show n/a")
+    if not sidecar():
+        print("note: metrics sidecar unreachable (METRICS_PORT) — PLE ms/op not shown")
     print("warmup...", flush=True)
     try:
         chat("hi", 8)
     except Exception as e:  # noqa: BLE001
         sys.exit(f"warmup request failed: {e}")
     print("ok\n")
+    if args.only == "warmup" or (args.only is None and not args.no_warmup):
+        warmup(args.levels)
     sections = {
         "ttft": ttft_probe,
         "decode": single_stream,

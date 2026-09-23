@@ -5,6 +5,8 @@ Env (same names as the other benches; defaults match serve.sh):
            GB10_BASE_URL is accepted too)
   MODEL    served model name; default: whatever /v1/models reports
   API_KEY  optional bearer token (serve.sh's API_KEY; GB10_API_KEY accepted)
+  METRICS_PORT  engine-side metrics sidecar port on the same host (serve.sh
+           METRICS_PORT, default 18400; 0 = don't read it)
 
 Everything goes through /v1/chat/completions — the path real clients use, so
 the chat template and the reasoning parser are part of the measurement.
@@ -18,6 +20,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 BASE = (os.environ.get("BASE") or os.environ.get("GB10_BASE_URL")
         or "http://localhost:8000").rstrip("/")
@@ -163,6 +166,41 @@ def metrics():
         if vals:
             out[key] = sum(float(v) for v in vals)
     return out
+
+
+_SIDECAR_PORT = int(os.environ.get("METRICS_PORT", "18400") or 0)
+_SIDECAR = (f"http://{urlparse(BASE).hostname}:{_SIDECAR_PORT}/metrics"
+            if _SIDECAR_PORT else None)
+_PLE = {"ple_ops": "vllm:ple_mmap_ops_total", "ple_op_ms": "vllm:ple_mmap_op_ms_total",
+        "ple_gather_ms": "vllm:ple_mmap_gather_ms_total"}
+
+
+def sidecar():
+    """PLE gather counters from the engine-side sidecar; {} when unreachable."""
+    if not _SIDECAR:
+        return {}
+    try:
+        text = urllib.request.urlopen(_SIDECAR, timeout=5).read().decode()
+    except Exception:  # noqa: BLE001 - optional
+        return {}
+    out = {}
+    for key, name in _PLE.items():
+        m = re.search(rf"^{re.escape(name)}\s+([0-9.eE+-]+)$", text, re.M)
+        if m:
+            out[key] = float(m.group(1))
+    return out
+
+
+def ple_summary(s0, s1):
+    """'PLE 3.1 ms/op (gather 1.2)' over a sidecar() pair — per-workload cost,
+    unlike the lifetime average that mixes decode steps and prefill chunks.
+    op = hash + gather + H2D, and it includes waiting for the GPU to finish
+    the preceding layer (the lookup is a sync point)."""
+    ops = delta(s0, s1, "ple_ops")
+    if not ops:
+        return ""
+    return (f"PLE {delta(s0, s1, 'ple_op_ms') / ops:.1f} ms/op "
+            f"(gather {delta(s0, s1, 'ple_gather_ms') / ops:.1f})")
 
 
 def delta(m0, m1, key):
