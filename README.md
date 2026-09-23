@@ -291,6 +291,13 @@ work unchanged with a non-default port or with auth on. Their defaults match
 also takes `host:port` as its argument and, without `MODEL`, uses whatever
 `/v1/models` reports.
 
+For a quick overall picture after a change, run `python3 bench/perf.py`
+(TTFT, single-stream decode, a concurrency sweep, long-context prefill) and
+`python3 bench/longctx.py` (N concurrent long prompts). Both go through the
+chat API like real clients, use unique prompts so the prefix cache cannot
+flatter prefill, report decode speed separately from TTFT, and flag rows where
+requests queued above `SEQS` or were preempted for KV space.
+
 For graphs, scrape **two** endpoints: vLLM's own `/metrics` on `PORT` (request
 throughput, cache usage, queue time) and the engine-side sidecar on
 `METRICS_PORT` (default 18400) — PLE gather cost
@@ -557,6 +564,9 @@ scripts/serve-intel-ar.sh     the docker run behind serve.sh
 scripts/smoke-test.sh         health + coherence + prefill/decode numbers
 bench/decode_bench.py         batch-1 decode / TTFT / spec-acceptance bench
 bench/concurrency_bench.py    N-stream throughput / TTFT / queue-time bench
+bench/perf.py                 one-command overview over the chat API: TTFT, decode, concurrency, prefill
+bench/longctx.py              concurrent long-context test (unique prompts; queue / preemption / cache checks)
+bench/common.py               shared chat-API client for perf.py / longctx.py
 tools/eval_quality.py         ppl + greedy-facts quality check against the API
 tools/quantize_mtp_experts_int4.py  int4 RTN the MTP draft experts -> the -MTP_int4RTN checkpoint variant
 tools/build_draft_vocab.py    rebuild draft_vocab_65536.npy over your own corpus
