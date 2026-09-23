@@ -74,9 +74,10 @@ def unique_prompt(seed, approx_tokens, tail="Reply with only: OK"):
     return f"Document {seed}. Below is a log excerpt.\n\n{body}\n\n{tail}"
 
 
-def chat(prompt, max_tokens, thinking=False, stream=False, timeout=3600):
+def chat(prompt, max_tokens, thinking=False, stream=False, timeout=3600, ignore_eos=False):
     """One chat completion -> dict(e2e, ttft, completion_tokens, prompt_tokens,
-    cached_tokens, finish_reason). ttft is None when not streaming."""
+    cached_tokens, finish_reason). ttft is None when not streaming.
+    ignore_eos=True (vLLM extension) forces exactly max_tokens tokens."""
     body = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -87,6 +88,8 @@ def chat(prompt, max_tokens, thinking=False, stream=False, timeout=3600):
     }
     if stream:
         body["stream_options"] = {"include_usage": True}
+    if ignore_eos:
+        body["ignore_eos"] = True
     req = urllib.request.Request(BASE + "/v1/chat/completions",
                                  json.dumps(body).encode(), HEADERS)
     t0 = time.perf_counter()

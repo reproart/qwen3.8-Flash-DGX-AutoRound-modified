@@ -17,12 +17,14 @@ prefilled one after another — TTFT grows linearly, s/stream stays flat, and
 the waiting shows up as "queue" (not scheduled yet) even below
 --max-num-seqs (serve.sh SEQS, default 8, the other reason to queue).
 
-KV capacity: with the default --gen 24 each request finishes right after its
-prefill and frees its KV before the next one is admitted, so total ctx can
-exceed the pool without preemption — that tests prefill, not capacity. To
-keep earlier streams resident while later ones prefill (a real capacity
-test), generate long enough to outlast the others' prefill, e.g. --gen 12000
-for 8 x 120k (~60 s of prefill each at ~2.1k tok/s). Limits:
+KV capacity: by default each request answers "OK" right after its prefill
+and frees its KV before the next one is admitted, so total ctx can exceed the
+pool without preemption — that tests prefill, not capacity. --gen N forces
+exactly N generated tokens per stream (ignore_eos), so earlier streams stay
+resident while later ones prefill: a real capacity test. N ~ 1000 is enough —
+while another stream prefills, each engine step carries an 8192-token chunk
+(~4 s), so a resident stream only decodes a few hundred tokens during the
+others' prefill. The "gen" column shows what was actually generated. Limits:
   * the KV pool (serve.sh KV_BYTES; ~31 KB/token, so 30g ~ 966k tokens —
     the boot log prints "GPU KV cache size"): when N x ctx exceeds it, vLLM preempts running requests and
     recomputes them later ("preempt" > 0) — wall time jumps.
@@ -38,12 +40,14 @@ from common import chat, delta, metrics, unique_prompt
 
 
 def run_level(n, ctx, gen):
+    forced = gen is not None
     out, errors = [None] * n, []
     tag = uuid.uuid4().hex[:8]  # fresh per row: no cross-row reuse either
 
     def worker(i):
         try:
-            out[i] = chat(unique_prompt(f"{tag}-{i}", ctx), gen, stream=True)
+            out[i] = chat(unique_prompt(f"{tag}-{i}", ctx), gen if forced else 24,
+                          stream=True, ignore_eos=forced)
         except Exception as e:  # noqa: BLE001 - reported below
             errors.append(repr(e))
 
@@ -62,8 +66,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--ctx", type=int, default=80000,
                     help="approx. prompt tokens per stream (default 80000)")
-    ap.add_argument("--gen", type=int, default=24,
-                    help="tokens generated per stream (default 24; large = keep KV resident)")
+    ap.add_argument("--gen", type=int, default=None,
+                    help="force exactly N generated tokens per stream (ignore_eos) to keep "
+                         "KV resident — a capacity test; default: a short 'OK' answer")
     ap.add_argument("--streams", nargs="+", type=int, default=[1, 2, 4, 8],
                     help="concurrency levels (default: 1 2 4 8)")
     args = ap.parse_args()
@@ -72,9 +77,9 @@ def main():
     print("warmup...", flush=True)
     chat(unique_prompt(uuid.uuid4().hex, 400), 16)
     print("ok\n")
-    print(f"{'streams':>7} {'ctx each':>9} {'total ctx':>10} {'cached':>7} {'wall':>8} "
+    print(f"{'streams':>7} {'ctx each':>9} {'total ctx':>10} {'gen':>6} {'cached':>7} {'wall':>8} "
           f"{'TTFT p50':>9} {'TTFT max':>9} {'s/stream':>9} {'queue':>7} {'preempt':>8}")
-    print("-" * 92)
+    print("-" * 99)
 
     for n in args.streams:
         done, errors, wall, m0, m1 = run_level(n, args.ctx, args.gen)
@@ -93,7 +98,8 @@ def main():
         def f(x, spec):
             return "n/a" if x is None else f"{x:{spec}}"
 
-        print(f"{n:>7} {done[0]['prompt_tokens']:>9} {total:>10} {f(hits, '>7.0f')} {wall:>7.1f}s "
+        gen_avg = statistics.mean(r["completion_tokens"] for r in done)
+        print(f"{n:>7} {done[0]['prompt_tokens']:>9} {total:>10} {gen_avg:>6.0f} {f(hits, '>7.0f')} {wall:>7.1f}s "
               f"{f(statistics.median(ttfts) if ttfts else None, '>8.1f')}s "
               f"{f(max(ttfts) if ttfts else None, '>8.1f')}s {wall / n:>8.1f}s "
               f"{f(queue, '>6.1f')}s {f(pre, '>8.0f')}")
