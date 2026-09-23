@@ -81,32 +81,39 @@ assert "vllm:never_evict_blocks_reserved 5.0" in text, text
 print("pin source detached: gauges hold last value, no exception")
 
 # _announce must NEVER be silent: a sidecar that starts without saying so is
-# the failure mode this endpoint exists to avoid. Force the no-vLLM path so the
-# assertion holds both here (no vllm) and inside the image (vllm present).
-import builtins  # noqa: E402
+# the failure mode this endpoint exists to avoid.
 import contextlib  # noqa: E402
 import io  # noqa: E402
+import logging  # noqa: E402
 
-_saved = {k: sys.modules.pop(k) for k in list(sys.modules)
-          if k == "vllm" or k.startswith("vllm.")}
-_real_import = builtins.__import__
-
-
-def _blocked(name, *a, **kw):
-    if name == "vllm" or name.startswith("vllm."):
-        raise ImportError("blocked for the test")
-    return _real_import(name, *a, **kw)
-
-
-builtins.__import__ = _blocked
+# 1) No logging configured at all (no handler anywhere): stderr fallback.
+_buf = io.StringIO()
+_root_handlers = logging.getLogger().handlers[:]
+logging.getLogger().handlers.clear()
 try:
-    _buf = io.StringIO()
     with contextlib.redirect_stderr(_buf):
         cm._announce()
 finally:
-    builtins.__import__ = _real_import
-    sys.modules.update(_saved)
+    logging.getLogger().handlers[:] = _root_handlers
 assert "sidecar on" in _buf.getvalue(), f"announce was silent: {_buf.getvalue()!r}"
 print("announce: non-silent fallback OK")
+
+# 2) vLLM-style setup: a handler on the "vllm" logger tree only, propagation
+# off. The announce must land there (it used to go to a logger outside the
+# tree and vanish from the server log).
+_vl = logging.getLogger("vllm")
+_cap = io.StringIO()
+_h = logging.StreamHandler(_cap)
+_vl.addHandler(_h)
+_vl.setLevel(logging.INFO)
+_vl.propagate = False
+try:
+    cm._announce()
+finally:
+    _vl.removeHandler(_h)
+    _vl.propagate = True
+    _vl.setLevel(logging.NOTSET)
+assert "sidecar on" in _cap.getvalue(), f"announce missed the vllm logger: {_cap.getvalue()!r}"
+print("announce: reaches the vllm logger tree OK")
 
 print("ALL OK")

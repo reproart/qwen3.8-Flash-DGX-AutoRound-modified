@@ -38,7 +38,9 @@ the first one to push owns the endpoint. Every failure is logged once and
 swallowed — telemetry must never take the server down.
 """
 import errno
+import logging
 import os
+import sys
 import threading
 
 _PORT = int(os.environ.get("VLLM_CUSTOM_METRICS_PORT", "18400") or 0)
@@ -68,16 +70,37 @@ def set_pin_source(scheduler) -> None:
     start()
 
 
+# Under "vllm." on purpose: vLLM configures handlers for the "vllm" logger
+# tree only, so a logger named after this module ("vllm_custom_metrics") had
+# no handler and its INFO lines were silently dropped in the server log.
+_logger = logging.getLogger("vllm.custom_metrics")
+
+
+def _has_handler(logger: logging.Logger) -> bool:
+    lg = logger
+    while lg is not None:
+        if lg.handlers:
+            return True
+        if not lg.propagate:
+            return False
+        lg = lg.parent
+    return False
+
+
+def _emit(level: int, msg: str) -> None:
+    """Log through vLLM's logger tree; fall back to stderr when nothing would
+    actually print it (no vLLM logging configured, or level filtered out)."""
+    if _has_handler(_logger) and _logger.isEnabledFor(level):
+        _logger.log(level, "%s", msg)
+    else:
+        print(msg, file=sys.stderr, flush=True)
+
+
 def _log_once(msg: str) -> None:
     if _warned[0]:
         return
     _warned[0] = True
-    try:
-        from vllm.logger import init_logger
-        init_logger(__name__).warning("%s", msg)
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning("%s", msg)
+    _emit(logging.WARNING, msg)
 
 
 # --- metric objects ---------------------------------------------------------
@@ -204,11 +227,5 @@ def _announce() -> None:
     """Log that the sidecar is up. Never silent: if vLLM's logger is unusable,
     fall back to stderr — a sidecar that starts without saying so is exactly
     the failure mode this endpoint must not have."""
-    msg = ("vllm_custom_metrics: engine-side Prometheus sidecar on :%d "
-           "(refresh every %.0fs)" % (_PORT, _INTERVAL))
-    try:
-        from vllm.logger import init_logger
-        init_logger(__name__).info(msg)
-    except Exception:
-        import sys
-        print(msg, file=sys.stderr, flush=True)
+    _emit(logging.INFO, "vllm_custom_metrics: engine-side Prometheus sidecar on "
+          ":%d (refresh every %.0fs)" % (_PORT, _INTERVAL))
