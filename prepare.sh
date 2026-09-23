@@ -50,12 +50,46 @@
 # Usage: prepare.sh <checkpoint-dir> <ple-table-dir>
 # Then point serve.sh's MODEL_DIR at <checkpoint-dir>-MTP_int4RTN and
 # TABLE_DIR at the table dir.
+#
+# Resumable: if a step fails (network, disk), fix the cause and run the same
+# command again. Finished steps are skipped — the download via a marker file
+# (<checkpoint-dir>/.prepare-downloaded), everything else because each tool
+# detects its own finished work and never re-quantizes or overwrites a backup.
+# The download skips shards that hold only the n-gram table (step 4 drops
+# them from the index anyway) when the huggingface_hub Python package is
+# importable; otherwise it falls back to a plain full `hf download`.
 set -euo pipefail
 CKPT="${1:?usage: prepare.sh <checkpoint-dir> <ple-table-dir>}"
 TABLE="${2:?usage: prepare.sh <checkpoint-dir> <ple-table-dir>}"
 cd "$(dirname "$0")"
 
-hf download Intel/Qwen3.8-Flash-Next-W4A16-AutoRound --local-dir "$CKPT"
+SRC_REPO=Intel/Qwen3.8-Flash-Next-W4A16-AutoRound
+
+# 1. Download. Once finished, never again: a re-download would compare the
+# already-modified shards against the hub and silently restore the originals.
+if [ -e "$CKPT/.prepare-downloaded" ]; then
+  echo ">> step 1: download already done ($CKPT/.prepare-downloaded), skipping"
+else
+  hf download "$SRC_REPO" model.safetensors.index.json --local-dir "$CKPT"
+  if python3 -c 'import huggingface_hub' 2>/dev/null; then
+    python3 - "$SRC_REPO" "$CKPT" <<'EOF'
+import json, os, sys
+from huggingface_hub import snapshot_download
+repo, ckpt = sys.argv[1], sys.argv[2]
+wm = json.load(open(os.path.join(ckpt, "model.safetensors.index.json")))["weight_map"]
+by_file = {}
+for tensor, fname in wm.items():
+    by_file.setdefault(fname, []).append(tensor)
+table_only = sorted(f for f, ts in by_file.items()
+                    if all(".ngram_embedding." in t for t in ts))
+print(">> skipping %d table-only shard(s): %s" % (len(table_only), ", ".join(table_only) or "-"))
+snapshot_download(repo, local_dir=ckpt, ignore_patterns=table_only)
+EOF
+  else
+    echo ">> huggingface_hub not importable from python3 — downloading the full repo"
+    hf download "$SRC_REPO" --local-dir "$CKPT"
+  fi
+fi
 
 # A download can finish while leaving the checkpoint unusable: the Intel
 # release on HF has been seen missing a shard it references. Check here, where
@@ -86,6 +120,7 @@ print(">> checkpoint complete: %d files referenced by the index, all present%s"
          "" if not missing_table else " (%d table-only shard(s) absent, stripped in step 4: %s)"
          % (len(missing_table), ", ".join(missing_table))))
 EOF
+touch "$CKPT/.prepare-downloaded"
 
 tools/quantize_lm_head_int8.py "$CKPT"
 tools/fp8_convert.py "$CKPT"
@@ -93,10 +128,15 @@ tools/strip_ngram_index.py "$CKPT"
 tools/fetch-ple-table-fp8.sh "$TABLE"
 
 python3 - "$CKPT" <<'EOF'
-import json, shutil, sys
+import json, os, shutil, sys
 ckpt = sys.argv[1]
-shutil.copy2(f"{ckpt}/config.json", f"{ckpt}/config.json.autoround")
 cfg = json.load(open(f"{ckpt}/config.json"))
+if cfg.get("quantization_config", {}).get("quant_method") == "gptq":
+    print(">> quantization_config already rewritten, skipping")
+    sys.exit(0)
+# Never overwrite the backup: on a re-run it is the only AutoRound original.
+if not os.path.exists(f"{ckpt}/config.json.autoround"):
+    shutil.copy2(f"{ckpt}/config.json", f"{ckpt}/config.json.autoround")
 cfg["quantization_config"] = {
     "quant_method": "gptq",
     "bits": 4,

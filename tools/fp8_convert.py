@@ -5,10 +5,15 @@ block 128x128). In-place: affected shards are rewritten, originals -> .bf16.bak.
 
 Only converts tensors whose both dims are divisible by 128 (all listed families
 qualify); anything else is left untouched and reported.
+
+Safe to re-run (e.g. after an interrupted prepare.sh): tensors that are already
+fp8 are skipped, never re-quantized, and an existing .bf16.bak (the true
+original) is never overwritten. Each shard is written to a temp file and
+renamed into place, and the index is saved after every shard.
 """
 import json
+import os
 import re
-import shutil
 import sys
 
 import torch
@@ -44,6 +49,13 @@ def block_quant(w: torch.Tensor):
     )
 
 
+def _save_index(idx: dict, idx_path: str) -> None:
+    tmp = idx_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(idx, f)  # same compact format as always (hash-stable)
+    os.replace(tmp, idx_path)
+
+
 def main():
     idx_path = f"{ROOT}/model.safetensors.index.json"
     idx = json.load(open(idx_path))
@@ -54,27 +66,49 @@ def main():
         by_file.setdefault(fname, []).append(name)
     print(f"{len(targets)} tensors across {len(by_file)} shards")
 
-    worst = 0.0
+    worst, converted, already = 0.0, 0, 0
     for i, (fname, names) in enumerate(sorted(by_file.items())):
         path = f"{ROOT}/{fname}"
         tensors = load_file(path)
+        changed = False
         for name in names:
+            scale_name = name.replace(".weight", ".weight_scale_inv")
             w = tensors.pop(name)
+            if w.dtype == torch.float8_e4m3fn:
+                # Converted by an earlier (possibly interrupted) run: keep it,
+                # just make sure the index knows about its scale.
+                tensors[name] = w
+                if scale_name in tensors:
+                    wm[scale_name] = fname
+                already += 1
+                continue
             if w.shape[0] % BLOCK or w.shape[1] % BLOCK:
                 print(f"  SKIP (shape) {name} {tuple(w.shape)}")
                 tensors[name] = w
                 continue
             q, scale, rel = block_quant(w)
+            # Check before anything is written: a bad tensor must not leave a
+            # half-converted checkpoint behind.
+            assert rel < 0.10, f"fp8 roundtrip error unexpectedly large for {name}: {rel:.4f}"
             worst = max(worst, rel)
             tensors[name] = q
-            tensors[name.replace(".weight", ".weight_scale_inv")] = scale
-            wm[name.replace(".weight", ".weight_scale_inv")] = fname
-        shutil.move(path, path + ".bf16.bak")
-        save_file(tensors, path)
-        print(f"[{i + 1}/{len(by_file)}] {fname}: {len(names)} tensors")
-    json.dump(idx, open(idx_path, "w"))
-    print(f"done. worst per-tensor max rel err: {worst:.4f}")
-    assert worst < 0.10, "fp8 roundtrip error unexpectedly large"
+            tensors[scale_name] = scale
+            wm[scale_name] = fname
+            converted += 1
+            changed = True
+        if changed:
+            tmp = path + ".fp8.tmp"
+            save_file(tensors, tmp)  # no metadata: byte-identical to earlier runs
+            if os.path.exists(path + ".bf16.bak"):
+                os.remove(path)  # the .bak from an earlier run is the original
+            else:
+                os.rename(path, path + ".bf16.bak")
+            os.replace(tmp, path)
+        _save_index(idx, idx_path)
+        print(f"[{i + 1}/{len(by_file)}] {fname}: {len(names)} tensors"
+              f"{'' if changed else ' (already fp8, skipped)'}")
+    print(f"done: {converted} converted, {already} already fp8; "
+          f"worst per-tensor max rel err: {worst:.4f}")
 
 
 if __name__ == "__main__":

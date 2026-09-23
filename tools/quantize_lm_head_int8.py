@@ -10,14 +10,17 @@ Layout produced (matches auto_round:auto_gptq 8-bit):
   lm_head.qzeros   int32 [groups, out/4]  all bytes 127 (zp=128, v1 storage)
   lm_head.scales   f16   [groups, out]
 
-Quantization: per group of 128 in-features, scale = w[argmax|w|] / 128 with
-the SIGN of the largest-magnitude element kept (full-range symmetric: the
--128 slot is usable), q = clamp(round(w/scale) + 128, 0, 255).
+Quantization: per group of 128 in-features, scale = w[argmax|w|] / -128, i.e.
+the scale carries the OPPOSITE sign of the largest-magnitude element, so that
+element lands exactly on the -128 slot (full-range symmetric: the -128 slot is
+usable), q = clamp(round(w/scale) + 128, 0, 255). An all-zero group gets
+scale 0 and q = 128 (dequantizes to 0) instead of NaN.
 
 Usage:
   quantize_lm_head_int8.py <checkpoint_dir> [--shard model-00001-of-*.safetensors]
 The original shard is kept as <shard>.bf16head.bak; the model index json is
 updated. Run with --dry-run to write to <shard>.int8head instead.
+Safe to re-run: an already-quantized checkpoint is reported and left alone.
 """
 
 import argparse
@@ -48,9 +51,9 @@ def quantize(w: torch.Tensor):
     wmax = wg.amax(dim=1)
     picked = torch.where(-wmin > wmax, wmin, wmax)
     scale = (picked / -128).to(torch.float16)  # [g, out]
-    q = torch.clamp(
-        torch.round(wg / scale.to(torch.float32).unsqueeze(1)) + 128, 0, 255
-    ).to(torch.uint8)  # [g, 128, out]
+    s32 = scale.to(torch.float32).unsqueeze(1)
+    s32 = torch.where(s32 == 0, torch.ones_like(s32), s32)  # all-zero group guard
+    q = torch.clamp(torch.round(wg / s32) + 128, 0, 255).to(torch.uint8)  # [g, 128, out]
     q = q.reshape(in_f, out_f)
     qweight = (
         q.reshape(in_f // PACK, PACK, out_f)
@@ -77,19 +80,48 @@ def main():
 
     index_path = os.path.join(args.ckpt_dir, "model.safetensors.index.json")
     index = json.load(open(index_path))
-    shard_name = args.shard or index["weight_map"].get("lm_head.weight")
+    wm = index["weight_map"]
+    if "lm_head.weight" not in wm and "lm_head.qweight" in wm:
+        print("lm_head already int8 (lm_head.qweight in index) — nothing to do")
+        return
+    shard_name = args.shard or wm.get("lm_head.weight")
     if shard_name is None:
-        sys.exit("lm_head.weight not in index — already quantized?")
+        sys.exit("neither lm_head.weight nor lm_head.qweight in the index")
     shard_path = os.path.join(args.ckpt_dir, shard_name)
 
+    bak_path = shard_path + ".bf16head.bak"
+    # An earlier run interrupted between the rename and the swap leaves only
+    # the backup: that IS the original shard, read it from there.
+    src_path = shard_path if os.path.exists(shard_path) else bak_path
     tensors, w = {}, None
-    with safe_open(shard_path, framework="pt", device="cpu") as f:
+    with safe_open(src_path, framework="pt", device="cpu") as f:
         for k in f.keys():
             if k == "lm_head.weight":
                 w = f.get_tensor(k)
             else:
                 tensors[k] = f.get_tensor(k)
-    assert w is not None, f"lm_head.weight not in {shard_name}"
+    if w is None and "lm_head.qweight" in tensors and not args.dry_run:
+        # Shard already repacked, only the index update was lost: finish it.
+        print(f"{shard_name} already holds the int8 head — updating the index only")
+    else:
+        assert w is not None, f"lm_head.weight not in {shard_name}"
+        _repack(args, shard_path, bak_path, tensors, w)
+        if args.dry_run:
+            return
+    del wm["lm_head.weight"]
+    for k in ("lm_head.qweight", "lm_head.qzeros", "lm_head.scales"):
+        wm[k] = shard_name
+    index.setdefault("metadata", {})["total_size"] = sum(
+        os.path.getsize(p) - (8 + int.from_bytes(open(p, "rb").read(8), "little"))
+        for p in glob.glob(os.path.join(args.ckpt_dir, "model-*-of-*.safetensors"))
+    )
+    with open(index_path + ".tmp", "w") as f:
+        json.dump(index, f, indent=2)
+    os.replace(index_path + ".tmp", index_path)
+    print(f"done: {shard_name} repacked, original at {shard_name}.bf16head.bak")
+
+
+def _repack(args, shard_path, bak_path, tensors, w):
     print(f"quantizing lm_head {tuple(w.shape)} bf16 -> int8 g{GROUP} sym")
     qweight, qzeros, scales = quantize(w)
     tensors["lm_head.qweight"] = qweight
@@ -100,18 +132,13 @@ def main():
         save_file(tensors, shard_path + ".int8head")
         print(f"dry run: wrote {shard_path}.int8head")
         return
-    os.rename(shard_path, shard_path + ".bf16head.bak")
-    save_file(tensors, shard_path)
-    wm = index["weight_map"]
-    del wm["lm_head.weight"]
-    for k in ("lm_head.qweight", "lm_head.qzeros", "lm_head.scales"):
-        wm[k] = shard_name
-    index["metadata"]["total_size"] = sum(
-        os.path.getsize(p) - (8 + int.from_bytes(open(p, "rb").read(8), "little"))
-        for p in glob.glob(os.path.join(args.ckpt_dir, "model-*-of-*.safetensors"))
-    )
-    json.dump(index, open(index_path, "w"), indent=2)
-    print(f"done: {shard_name} repacked, original at {shard_name}.bf16head.bak")
+    # Write first, then swap: an interrupted run never loses the original.
+    save_file(tensors, shard_path + ".int8head.tmp")
+    if not os.path.exists(bak_path):
+        os.rename(shard_path, bak_path)
+    elif os.path.exists(shard_path):
+        os.remove(shard_path)  # the .bak from an earlier run is the original
+    os.replace(shard_path + ".int8head.tmp", shard_path)
 
 
 if __name__ == "__main__":

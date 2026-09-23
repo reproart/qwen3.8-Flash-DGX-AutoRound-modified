@@ -62,8 +62,17 @@ def link_tree(src, dst):
     os.makedirs(dst, exist_ok=True)
     for name in sorted(os.listdir(src)):
         s, d = os.path.join(src, name), os.path.join(dst, name)
-        if name in REGEN or not os.path.isfile(s) or os.path.lexists(d):
+        if name in REGEN or not os.path.isfile(s):
             continue
+        if os.path.lexists(d):
+            # Up to date = the same inode (hardlink) or an identical copy
+            # (copy2 keeps size + mtime). Otherwise the source was rewritten
+            # since the last run (the prepare tools swap shards in by rename)
+            # and the old link would serve stale weights: refresh it.
+            ss, ds = os.stat(s), os.stat(d)
+            if os.path.samefile(s, d) or (ss.st_size, int(ss.st_mtime)) == (ds.st_size, int(ds.st_mtime)):
+                continue
+            os.unlink(d)
         try:
             os.link(s, d)
         except OSError:

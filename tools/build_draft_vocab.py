@@ -14,7 +14,7 @@ int32 .npy of ids.
 
 usage: build_draft_vocab.py <tokenizer_dir> <out.npy> [--n 65536] [--corpus path ...]
 """
-import argparse, collections, glob, json, os, sys
+import argparse, collections, glob, json, os
 import numpy as np
 
 ap = argparse.ArgumentParser()
