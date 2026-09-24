@@ -140,6 +140,17 @@ ITER_DETAILS="${ITER_DETAILS:-0}"
 # (publishing a mapping to nothing would just look healthy and lie).
 METRICS_PORT="${METRICS_PORT:-18400}"
 
+# WARMUP=1: after the container starts, wait for /health and run the first-use
+# JIT warmup (bench/perf.py --only warmup, ~20 s of requests), so the first
+# real clients do not pay the Triton compile stalls (~1 s each — the spec-decode
+# sampling kernels, the QSA split-k/merge kernels, the QSA indexer). Blocks
+# this script for the whole boot (~5-6 min; WARMUP_TIMEOUT caps the wait).
+# Only covers starts through this script: a container Docker restarts by
+# itself (after a reboot or crash) still comes up cold — run the warmup
+# command by hand after one. 0 = exit right after docker run, as before.
+WARMUP="${WARMUP:-0}"
+WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-900}"
+
 # PREFIX_CACHE=1: upstream disabled prefix caching over a CUBLAS error in the
 # GDN in_proj GEMM on the cached-block path; the fp8-hybrid in_proj bypasses
 # that kernel, and with FP8_HYBRID=1 prefix caching has been stable here.
@@ -327,3 +338,38 @@ docker run -d --name "$NAME" --restart "${RESTART:-unless-stopped}" \
 
 echo ">> $NAME starting on ${BIND_ADDR:-0.0.0.0}:$PORT (ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, gpu_mem=$GPU_MEM, draft_vocab=$DRAFT_VOCAB, draft_head=$DRAFT_HEAD, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, metrics=$METRICS_PORT)"
 echo ">> follow with: docker logs -f $NAME"
+
+if [ "$WARMUP" = 1 ]; then
+  REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+  PROBE_HOST="${BIND_ADDR:-127.0.0.1}"
+  if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1 \
+     || [ ! -f "$REPO_DIR/bench/perf.py" ]; then
+    echo "WARNING: WARMUP=1 but curl/python3 or bench/perf.py is missing — warmup skipped." >&2
+    echo "  Once the server is up, run by hand:  python3 bench/perf.py --only warmup" >&2
+  else
+    echo ">> WARMUP=1: waiting for http://$PROBE_HOST:$PORT/health (weight load ~5 min)..."
+    deadline=$((SECONDS + WARMUP_TIMEOUT))
+    healthy=0 dead=0
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      if curl -sf -m 5 "http://$PROBE_HOST:$PORT/health" >/dev/null 2>&1; then healthy=1; break; fi
+      if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != "true" ]; then dead=1; break; fi
+      sleep 5
+    done
+    if [ "$dead" = 1 ]; then
+      echo "WARNING: container '$NAME' exited while waiting — warmup skipped. Check: docker logs $NAME" >&2
+    elif [ "$healthy" != 1 ]; then
+      echo "WARNING: not healthy within ${WARMUP_TIMEOUT}s — warmup skipped (still loading? docker logs -f $NAME)." >&2
+      echo "  Then by hand:  python3 bench/perf.py --only warmup" >&2
+    else
+      echo ">> warming up first-use kernels (~20 s)..."
+      if BASE="http://$PROBE_HOST:$PORT" MODEL="${SERVED_NAME:-qwen3.8-flash-next}" \
+         API_KEY="$API_KEY" METRICS_PORT=0 \
+         python3 "$REPO_DIR/bench/perf.py" --only warmup; then
+        echo ">> $NAME up and warm on :$PORT"
+      else
+        echo "WARNING: warmup requests failed — the server may still be settling." >&2
+        echo "  Retry by hand:  python3 bench/perf.py --only warmup" >&2
+      fi
+    fi
+  fi
+fi

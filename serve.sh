@@ -57,6 +57,17 @@ export YARN=0
 # no = только ручной запуск через ./serve.sh.
 export RESTART=unless-stopped
 
+# WARMUP=1: after starting the container, serve.sh waits for /health and runs
+# bench/perf.py --only warmup — the first-use Triton kernel compiles that
+# otherwise stall whoever hits the server first (~1 s each, see the README's
+# Warmup section). The script returns once the server is actually fast
+# (~5-6 min: weight load + ~20 s warmup). 0 = return right after docker run
+# (the bare scripts/serve-intel-ar.sh default).
+# Caveat: this hook runs only for starts through this script — a container
+# Docker restarts by itself (after a reboot or crash) comes up cold; after
+# one, run `python3 bench/perf.py --only warmup` once.
+export WARMUP=1
+
 # madvise(MADV_RANDOM) the PLE mmap: no readahead around 160-byte row faults.
 # Upstream (blazux 0c6df7e) measured 4-8% faster cold prefill and a cleaner
 # page cache; on by default. 0 = kernel readahead (worth trying when the

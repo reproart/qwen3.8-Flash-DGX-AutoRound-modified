@@ -117,9 +117,9 @@ hf download Saren/Qwen3.8-Flash-Next-ple-table-fp8 --local-dir /models/ple-table
 # (or build them yourself from Intel's release: ./prepare.sh — see below)
 
 # Point serve.sh at your checkpoint + table dirs, then:
-./serve.sh                           # boots on :8000 (~5 min with fastsafetensors)
-docker logs -f qwen38-flash          # wait for "Application startup complete"
-python3 bench/perf.py --only warmup  # optional: compile first-use kernels now (see Warmup)
+./serve.sh                           # boots on :8000 (~5 min with fastsafetensors),
+                                     # waits for /health, then runs the JIT warmup (WARMUP=1)
+docker logs -f qwen38-flash          # optional: watch the startup
 ```
 
 Then hit the OpenAI-compatible API:
@@ -212,6 +212,7 @@ or edit the paths in `serve.sh` (the example config used above) and run it.
 | `FLASHINFER_AUTOTUNE` | `0` | `1` — enable flashinfer kernel autotuning (longer warmup, possibly faster kernels) |
 | `CUDA_LAUNCH_BLOCKING` | `0` | `1` — synchronous CUDA errors, for debugging Xid 31 (much slower; not for production) |
 | `RESTART` | `unless-stopped` | Container restart policy — survives reboots and crashes; `no` = manual start only. The next `./serve.sh` re-creates the container with this value |
+| `WARMUP` | `1` | After `docker run`, wait for `/health` (up to `WARMUP_TIMEOUT=900` s) and run `bench/perf.py --only warmup` — the first-use Triton kernels compile there instead of stalling real clients (see [Warmup](#warmup)). The script returns once the server is fast (bare script: `0` — returns right after `docker run`). Only covers starts through the script: a container Docker restarts by itself (reboot, crash) still comes up cold — run the warmup command by hand after one |
 | `LOG_MAX_SIZE` / `LOG_MAX_FILE` | `10m` / `3` | Docker log rotation — `PLE mmap stats` logs a line every 30 s, so an unbounded log grows to GBs |
 | `NAME` / `IMAGE` | `qwen38-flash` / `qwen38-flash-dgx` | Container / image names (`IMAGE` is not overwritten by serve.sh — point it at a backup tag to roll back) |
 | `EXTRA` | | Extra vLLM flags, passed verbatim |
@@ -616,7 +617,12 @@ prompt. Each is a stall of about a second for whoever hits it first — on a
 fresh container the first 4-stream wave saw TTFT 1.94 s instead of 0.39 s.
 `python3 bench/perf.py --only warmup` touches all of those shapes in ~20 s;
 `bench/perf.py` runs it before measuring (`--no-warmup` to measure a cold
-server).
+server). `serve.sh` does it automatically after every start it makes
+(`WARMUP=1`): the script waits for `/health`, runs the warmup requests, and
+only then returns — the server is fast from the moment it does. Starts
+Docker performs by itself — a reboot or crash-recovery of the same
+container — have no host-side hook, so run the warmup command once after
+those (or let the first requests pay ~1 s each).
 
 ## What's in here
 
