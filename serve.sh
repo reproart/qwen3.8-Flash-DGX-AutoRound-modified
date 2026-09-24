@@ -42,10 +42,12 @@ export GPU_MEM=0.01
 export KV_BYTES=30g
 
 # Context: 262144 native. For 500k via YaRN set CTX=500000 YARN=1 (the
-# upstream-validated ceiling). KV costs ~31 KB/token: KV_BYTES=30g (vLLM
-# reads "g" as 10^9 bytes = 27.9 GiB) holds ~966k tokens — one 500k request
-# with room to spare, or ~3.7 full 262k contexts. Every GiB of KV is a GiB
-# less page cache for the ~48 GiB PLE table, so raise it carefully. The launcher pins
+# upstream-validated ceiling). KV_BYTES=30g (vLLM reads "g" as 10^9 bytes =
+# 27.9 GiB) held ~4 concurrent 127k contexts (~0.55M tokens, ~53 KB/token
+# measured) on a GX10 — the boot log's "~966k tokens" overstates it. 35g/40g
+# fit ~5/~6 such contexts but cost 2-7% long-prefill speed: every GiB of KV
+# is a GiB less page cache for the ~48 GiB PLE table. See the README's
+# "Sizing the KV pool" before raising it. The launcher pins
 # the MTP draft model's length to CTX so speculative decoding still boots.
 export CTX=262144
 export YARN=0

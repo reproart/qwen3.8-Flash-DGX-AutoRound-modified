@@ -185,7 +185,7 @@ or edit the paths in `serve.sh` (the example config used above) and run it.
 | `YARN` | `0` | `1` = Qwen's YaRN rope scaling (factor 4) past the native 262144 — set `CTX` too (500k was upstream's validated ceiling). Also forces the MTP draft's `max_model_len`, which `--hf-overrides` alone doesn't reach |
 | `SEQS` | `8` | Max concurrent sequences (don't benchmark with 1–2, see below) |
 | `GPU_MEM` | `0.01` | Near-zero pool fraction, paired with `KV_BYTES`: deterministic sizing, so the driver never oversubscribes the unified pool (`NV_ERR_NO_MEMORY` / Xid 31 freezes). Bare script: a `0.85` fraction — avoid on unified-memory boxes. |
-| `KV_BYTES` | `30g` | Explicit KV pool size, passed as `--kv-cache-memory-bytes` (bare script: unset). vLLM reads `g` as 10⁹ bytes: `30g` = 27.9 GiB ≈ 966k tokens at ~31 KB/token (the boot log prints "GPU KV cache size"). Every GiB here is a GiB less page cache for the ~48 GiB PLE table |
+| `KV_BYTES` | `30g` | Explicit KV pool size, passed as `--kv-cache-memory-bytes` (bare script: unset). vLLM reads `g` as 10⁹ bytes: `30g` = 27.9 GiB, measured to hold ~4 concurrent 127k contexts. When to raise it to `35g`/`40g`: see [Sizing the KV pool](#sizing-the-kv-pool-30g-35g-or-40g) |
 | `MTP` | `3` | Speculative tokens from the MTP head (`0` = off; bare script: `2`) |
 | `PREFIX_CACHE` | `1` | Prefix caching — fixed and recommended on this fork (bare script: `0`) |
 | `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (patch 9; @jschmied, vllm#55122): identical output at T=0 at full prefill speed. `0` = stock kernel (non-deterministic, may drop attention candidates) |
@@ -240,6 +240,54 @@ throughput, cache usage, queue time) and the engine-side sidecar on
 (`rate(vllm:ple_mmap_op_ms_total)/rate(vllm:ple_mmap_ops_total)` = ms/op), the
 mamba state-copy guard tripwire and the never-evict pin footprint. With the
 sidecar on, the `PLE mmap stats` log lines default off (`PLE_STATS_SEC=0`).
+
+### Sizing the KV pool: 30g, 35g or 40g
+
+**Keep the default `KV_BYTES=30g` unless you run five or more long (100k+
+token) sessions at the same time.** Measured on a GX10 (local NVMe table,
+MTP=3, `SEQS=8`; `bench/longctx.py --ctx 120000 --streams 8 --gen 1000` and
+`bench/perf.py --only prefill`, warmed up, 2026-09-24):
+
+| | `30g` (default) | `35g` (estimate) | `40g` |
+|---|---|---|---|
+| KV pool | 27.9 GiB | 32.6 GiB | 37.3 GiB |
+| Long contexts resident at once (~127k each) | **~4** (0.55M tokens) | ~5 (≈0.65M) | **~6** (0.77M) |
+| Preemptions, 8 × 127k | 0 | ? | 2 |
+| Long-prefill TTFT vs 30g (32k / 101k prompt) | 14.6 s / 50.0 s | ≈ +2–3.5% | +6.7% / +4.3% |
+| Single-stream decode | ~66 tok/s | ~66 tok/s | ~66 tok/s |
+
+The 35g column is interpolated from the two measured ones, not measured —
+run the two commands above if you pick it.
+
+Why it is a trade-off:
+
+- **What more KV buys.** vLLM admits a request only when its KV blocks fit,
+  so on a full pool extra long requests *wait* (`queue` in `longctx.py`)
+  rather than fail. More KV = more long sessions decoding at once (agents
+  with big contexts), and more room for the prefix cache to keep several long
+  conversations warm between turns. It does **not** speed up a batch of long
+  prompts: prefill runs one prompt at a time either way (8 × 127k took
+  548 s at 30g and 564–576 s at 40g).
+- **What it costs.** KV memory is pinned by the driver, so every GiB comes
+  out of the page cache that holds the ~48 GiB PLE table. At 40g ~2.5 GB of
+  page cache was left, n-gram row reads per 8k prefill chunk rose from
+  ~184 to ~273 ms at 101k, and long prefill slowed 4–7%. Decode is
+  unaffected (its hot rows stay cached). At 40g the pool also runs at ~99%
+  under load, so admitted requests occasionally get preempted and recomputed.
+- **Memory safety.** 40g ran for hours of mixed load without hangs; the
+  kernel moved ~6 GB of cold vLLM startup memory to swap once and did not
+  page it back (`vmstat` `si` ≈ 0). Check the same on your box — `vmstat 5`
+  during load (`si`/`so` should stay near 0) and `cat /proc/pressure/memory`
+  (`some avg10` near 0) — especially if other programs share the machine.
+- **Ignore the boot log's capacity.** "GPU KV cache size: 966,390 tokens" at
+  30g assumes ~31 KB/token; on long contexts the measured cost is ~53 KB/token
+  (the mamba/GDN state groups hold more than that estimate assumes), i.e.
+  ~0.55M tokens. `bench/longctx.py` prints the real figure for your settings.
+
+So: **30g** for chat, coding assistants and up to ~4 concurrent long
+contexts (fastest prefill, no preemption); **35g** if you regularly have
+exactly one more long session than that; **40g** for 5–6 concurrent long
+sessions, accepting ~5% slower long prefill.
 
 
 ## Limitations & notes

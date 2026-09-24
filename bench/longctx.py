@@ -31,9 +31,10 @@ resident while later ones prefill: a real capacity test. N ~ 1000 is enough —
 while another stream prefills, each engine step carries an 8192-token chunk
 (~4 s), so a resident stream only decodes a few hundred tokens during the
 others' prefill. The "gen" column shows what was actually generated. Limits:
-  * the KV pool (serve.sh KV_BYTES; ~31 KB/token, so 30g ~ 966k tokens —
-    the boot log prints "GPU KV cache size"): when N x ctx exceeds it, vLLM preempts running requests and
-    recomputes them later ("preempt" > 0) — wall time jumps.
+  * the KV pool (serve.sh KV_BYTES; measured ~53 KB/token on long contexts,
+    so 30g ~ 0.55M tokens — the boot log's "GPU KV cache size" overstates
+    it): requests wait for admission ("queue"); an admitted one that runs out
+    of blocks while growing is preempted and recomputed ("preempt" > 0).
 """
 import argparse
 import statistics
