@@ -13,6 +13,7 @@ the chat template and the reasoning parser are part of the measurement.
 Token counts always come from the server's `usage`, never from counting SSE
 events: with MTP each event can carry several tokens.
 """
+import itertools
 import json
 import os
 import random
@@ -37,10 +38,41 @@ CODE_PROMPT = (
     "in O(1), using a dict and a doubly linked list. Include docstrings."
 )
 
-_WORDS = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike "
-          "november oscar papa quebec romeo sierra tango uniform victor whiskey xray "
-          "yankee zulu scheduler kernel latency throughput quantize tensor gradient cache "
-          "pointer buffer register pipeline parallel entropy manifold").split()
+
+
+def _make_vocab(n=30000, seed=1234):
+    """A fixed synthetic vocabulary of n pronounceable pseudo-words."""
+    rng = random.Random(seed)
+    cons, vows = "bcdfghjklmnprstvwz", "aeiou"
+    words = set()
+    while len(words) < n:
+        k = rng.choice((1, 2, 2, 3, 3, 4))
+        words.add("".join(rng.choice(cons) + rng.choice(vows) for _ in range(k)))
+    return sorted(words)
+
+
+# Zipf-distributed word draws (weight 1/rank^1.07, like natural language): a
+# realistic spread of distinct n-grams for the PLE table. A few dozen fixed
+# words — the earlier generator — have so few distinct n-grams that every
+# table row they touch fits in a few hundred MB of page cache, hiding exactly
+# the disk reads that a smaller page cache (a bigger KV_BYTES) causes.
+_VOCAB = _make_vocab()
+_ZIPF_CUM = list(itertools.accumulate(1.0 / (r + 1) ** 1.07 for r in range(len(_VOCAB))))
+_TOK_PER_WORD = [None]
+
+
+def _tokens_per_word():
+    """Calibrate words -> tokens once with the server's /tokenize (fallback 2.0)."""
+    if _TOK_PER_WORD[0] is None:
+        sample = " ".join(random.Random(7).choices(_VOCAB, cum_weights=_ZIPF_CUM, k=2000))
+        try:
+            req = urllib.request.Request(BASE + "/tokenize", json.dumps(
+                {"model": MODEL, "prompt": sample}).encode(), HEADERS)
+            n = json.loads(urllib.request.urlopen(req, timeout=30).read())["count"]
+            _TOK_PER_WORD[0] = max(0.5, n / 2000)
+        except Exception:  # noqa: BLE001 - calibration is best-effort
+            _TOK_PER_WORD[0] = 2.0
+    return _TOK_PER_WORD[0]
 
 
 def _get(path, timeout=30):
@@ -65,12 +97,13 @@ def unique_prompt(seed, approx_tokens, tail="Reply with only: OK"):
     """A prompt nothing else shares — not even its first block.
 
     The seed is the very first text, so the prefix cache cannot reuse a single
-    block across prompts, and the body is pseudo-random words, so the PLE
-    n-gram table sees realistic row diversity instead of one repeated
-    sentence (repetitive filler makes the mmap gather look cheaper than it is).
+    block across prompts, and the body is Zipf-drawn words from a 30k-word
+    vocabulary, so the PLE n-gram table sees a realistic spread of rows
+    (repetitive filler makes the mmap gather look cheaper than it is).
     """
     rng = random.Random(seed)
-    body = " ".join(rng.choice(_WORDS) for _ in range(int(approx_tokens / 1.3)))
+    words = int(approx_tokens / _tokens_per_word())
+    body = " ".join(rng.choices(_VOCAB, cum_weights=_ZIPF_CUM, k=words))
     return f"Document {seed}. Below is a log excerpt.\n\n{body}\n\n{tail}"
 
 
