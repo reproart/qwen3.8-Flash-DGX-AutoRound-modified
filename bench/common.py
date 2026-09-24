@@ -7,6 +7,8 @@ Env (same names as the other benches; defaults match serve.sh):
   API_KEY  optional bearer token (serve.sh's API_KEY; GB10_API_KEY accepted)
   METRICS_PORT  engine-side metrics sidecar port on the same host (serve.sh
            METRICS_PORT, default 18400; 0 = don't read it)
+  VLLM_CUSTOM_METRICS_INTERVAL  the sidecar's refresh period (default 5 s, as
+           on the server); settled reads wait one period + 1 s
 
 Everything goes through /v1/chat/completions — the path real clients use, so
 the chat template and the reasoning parser are part of the measurement.
@@ -216,10 +218,22 @@ _PLE = {"ple_ops": "vllm:ple_mmap_ops_total", "ple_op_ms": "vllm:ple_mmap_op_ms_
         "ple_gather_ms": "vllm:ple_mmap_gather_ms_total"}
 
 
-def sidecar():
-    """PLE gather counters from the engine-side sidecar; {} when unreachable."""
+_SIDECAR_LAG = float(os.environ.get("VLLM_CUSTOM_METRICS_INTERVAL", "5") or 5) + 1.0
+_SIDECAR_SEEN = [False]
+
+
+def sidecar(settle=False):
+    """PLE gather counters from the engine-side sidecar; {} when unreachable.
+
+    The sidecar copies the engine's counters into Prometheus only every few
+    seconds, so a read right after a short request can miss its ops (they
+    then land in the NEXT measurement). settle=True waits one refresh period
+    first — use it for every read that closes (or opens, after other
+    traffic) a measured interval."""
     if not _SIDECAR:
         return {}
+    if settle and _SIDECAR_SEEN[0]:
+        time.sleep(_SIDECAR_LAG)
     try:
         text = urllib.request.urlopen(_SIDECAR, timeout=5).read().decode()
     except Exception:  # noqa: BLE001 - optional
@@ -229,6 +243,7 @@ def sidecar():
         m = re.search(rf"^{re.escape(name)}\s+([0-9.eE+-]+)$", text, re.M)
         if m:
             out[key] = float(m.group(1))
+    _SIDECAR_SEEN[0] = _SIDECAR_SEEN[0] or bool(out)
     return out
 
 

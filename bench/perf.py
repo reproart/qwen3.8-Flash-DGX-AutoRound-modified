@@ -25,10 +25,13 @@ What the columns mean (and the traps they avoid):
     merge kernels at a few concurrent streams, the QSA indexer on the first
     ~2k-token prompt) — seconds of stall that land in whatever runs first.
     The warmup pass touches those shapes before anything is measured;
-    `--only warmup` does just that (useful right after ./serve.sh), and
-    `--no-warmup` measures the cold server on purpose.
+    it runs before any section, also with `--only <section>`; `--only warmup`
+    does just that (useful right after ./serve.sh), and `--no-warmup`
+    measures the cold server on purpose.
   * PLE ms/op per section comes from the engine-side metrics sidecar
-    (METRICS_PORT), as a delta around that section only.
+    (METRICS_PORT), as a delta around that section only. The sidecar refreshes
+    every 5 s, so each closing read waits one refresh (~6 s per row) —
+    otherwise a short request's ops spill into the next row.
 """
 import argparse
 import statistics
@@ -96,7 +99,7 @@ def ttft_probe(n=5):
 def single_stream(n=5, max_tokens=700):
     print(f"## 2. Single-stream decode (code, thinking off, up to {max_tokens} tokens)")
     rows = []
-    s0 = sidecar()
+    s0 = sidecar(settle=True)
     for _ in range(n):
         m0 = metrics()
         r = chat(CODE_PROMPT, max_tokens, stream=True)
@@ -109,7 +112,7 @@ def single_stream(n=5, max_tokens=700):
     if short:
         print(f"   note: {len(short)} run(s) stopped early (<50% of max_tokens) — "
               "short runs overweight the fixed per-request cost")
-    ple = ple_summary(s0, sidecar())
+    ple = ple_summary(s0, sidecar(settle=True))
     print(f"   MEDIAN decode {_fmt(_med(decode_rate(r) for r, _ in rows), '.1f')} tok/s   "
           f"e2e {statistics.median(r['completion_tokens'] / r['e2e'] for r, _ in rows):.1f} tok/s"
           f"{'   ' + ple if ple else ''}\n")
@@ -121,12 +124,14 @@ def concurrency(levels, tokens=300):
           f"{'TTFT p50':>9} {'TTFT max':>9} {'queue':>9} {'PLE ms/op':>10}")
     print("   " + "-" * 85)
     peak = (0, 0.0)
+    s_prev = sidecar(settle=True)
     for n in levels:
-        m0, s0 = metrics(), sidecar()
+        m0, s0 = metrics(), s_prev
         # uuid first: unique from the first token, no prefix reuse
         done, errors, wall = _parallel(n, lambda i: chat(
             f"[{uuid.uuid4().hex[:8]}] {CODE_PROMPT} Variant {i}.", tokens, stream=True))
-        m1, s1 = metrics(), sidecar()
+        m1 = metrics()
+        s1 = s_prev = sidecar(settle=True)
         ops = delta(s0, s1, "ple_ops")
         ple = delta(s0, s1, "ple_op_ms") / ops if ops else None
         if errors:
@@ -155,11 +160,13 @@ def concurrency(levels, tokens=300):
 
 def prefill(targets):
     print("## 4. Long-context prefill (unique prompts, prefix cache checked)")
+    s_prev = sidecar(settle=True)
     for target in targets:
-        m0, s0 = metrics(), sidecar()
+        m0, s0 = metrics(), s_prev
         r = chat(unique_prompt(uuid.uuid4().hex, target), 8, stream=True)
         hits = delta(m0, metrics(), "pc_hits")
-        ple = ple_summary(s0, sidecar())
+        s_prev = sidecar(settle=True)
+        ple = ple_summary(s0, s_prev)
         fresh = r["prompt_tokens"] - (hits or 0)
         rate = fresh / r["ttft"] if r["ttft"] else None
         cached = "n/a" if hits is None else f"{hits:.0f}"
@@ -194,7 +201,9 @@ def main():
     except Exception as e:  # noqa: BLE001
         sys.exit(f"warmup request failed: {e}")
     print("ok\n")
-    if args.only == "warmup" or (args.only is None and not args.no_warmup):
+    # Warm up before any measured section (a cold server skews whichever
+    # section runs first), unless --no-warmup asks for the cold numbers.
+    if args.only == "warmup" or not args.no_warmup:
         warmup(args.levels)
     sections = {
         "ttft": ttft_probe,
